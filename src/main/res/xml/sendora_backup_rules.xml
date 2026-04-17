@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Guidance for host apps: merge this with your own backup rules via
+    tools:replace="android:fullBackupContent"
+  Excludes sendora_sdk SharedPreferences and encrypted prefs from Auto Backup
+  to avoid duplicating device IDs across restores.
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="sendora_sdk.xml" />
+    <exclude domain="sharedpref" path="sendora_sdk_secure.xml" />
+</full-backup-content>
