@@ -149,6 +149,8 @@ object Sendora {
             val response = client.post("/attribution/deferred", body)
             val data = (response?.get("data") as? Map<*, *>)
             val found = data?.get("found") as? Boolean ?: false
+            @Suppress("UNCHECKED_CAST")
+            val linkDataMap = (data?.get("deepLinkData") as? Map<String, Any>) ?: emptyMap()
             withContext(Dispatchers.Main) {
                 if (found) {
                     callback(SendoraLinkData(
@@ -157,8 +159,7 @@ object Sendora {
                         campaign = data?.get("campaign") as? String,
                         source = data?.get("source") as? String,
                         medium = data?.get("medium") as? String,
-                        @Suppress("UNCHECKED_CAST")
-                        linkData = (data?.get("deepLinkData") as? Map<String, Any>) ?: emptyMap(),
+                        linkData = linkDataMap,
                     ))
                 } else {
                     callback(null)
