@@ -1,4 +1,4 @@
-package com.sendora.sdk.internal
+package com.sendoracloud.sdk.internal
 
 import java.security.MessageDigest
 

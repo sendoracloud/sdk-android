@@ -1,4 +1,4 @@
-package com.sendora.sdk.internal
+package com.sendoracloud.sdk.internal
 
 import android.content.Context
 import android.content.pm.PackageManager

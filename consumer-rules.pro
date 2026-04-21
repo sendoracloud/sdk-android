@@ -1,6 +1,6 @@
 # Keep public SDK classes so R8/ProGuard don't strip them from consumer apps.
--keep public class com.sendora.sdk.** { public *; }
--keepclassmembers class com.sendora.sdk.** {
+-keep public class com.sendoracloud.sdk.** { public *; }
+-keepclassmembers class com.sendoracloud.sdk.** {
     public <methods>;
     public <fields>;
 }

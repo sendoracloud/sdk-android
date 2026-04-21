@@ -1,10 +1,10 @@
-package com.sendora.sdk.internal
+package com.sendoracloud.sdk.internal
 
 import android.util.Log
 
-internal object SendoraLogger {
+internal object SendoraCloudLogger {
     var isEnabled = false
-    private const val TAG = "Sendora"
+    private const val TAG = "SendoraCloud"
 
     fun debug(message: String) {
         if (isEnabled) Log.d(TAG, message)

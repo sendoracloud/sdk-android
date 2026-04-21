@@ -1,4 +1,4 @@
-package com.sendora.sdk.internal
+package com.sendoracloud.sdk.internal
 
 import android.content.Context
 import android.content.SharedPreferences
@@ -34,7 +34,7 @@ internal class Storage(context: Context) {
     }.getOrElse {
         // Fall back to plain prefs if Keystore is unavailable (very rare;
         // typically only on corrupt devices). Data still scoped to our app.
-        SendoraLogger.error("EncryptedSharedPreferences unavailable — falling back", it)
+        SendoraCloudLogger.error("EncryptedSharedPreferences unavailable — falling back", it)
         prefs
     }
 
@@ -90,7 +90,7 @@ internal class Storage(context: Context) {
             }
             prefs.edit().putString("event_queue", jsonArray.toString()).apply()
         } catch (e: Exception) {
-            SendoraLogger.error("Failed to save event queue", e)
+            SendoraCloudLogger.error("Failed to save event queue", e)
         }
     }
 

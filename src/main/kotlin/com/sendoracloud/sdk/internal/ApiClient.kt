@@ -1,4 +1,4 @@
-package com.sendora.sdk.internal
+package com.sendoracloud.sdk.internal
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -45,7 +45,7 @@ internal class ApiClient(
             !fullUrl.startsWith("http://localhost") &&
             !fullUrl.startsWith("http://10.0.2.2") &&
             !fullUrl.startsWith("http://127.0.0.1")) {
-            SendoraLogger.error("ApiClient refusing non-HTTPS URL")
+            SendoraCloudLogger.error("ApiClient refusing non-HTTPS URL")
             return null
         }
         return try {
@@ -71,7 +71,7 @@ internal class ApiClient(
                 json.keys().asSequence().associateWith { key -> json.get(key) }
             }
         } catch (e: Exception) {
-            SendoraLogger.debug("API error ($path): ${e.message}")
+            SendoraCloudLogger.debug("API error ($path): ${e.message}")
             recordFailure()
             null
         }

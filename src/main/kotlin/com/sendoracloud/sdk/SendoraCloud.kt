@@ -1,4 +1,4 @@
-package com.sendora.sdk
+package com.sendoracloud.sdk
 
 import android.content.Context
 import android.content.Intent
@@ -6,7 +6,7 @@ import android.net.Uri
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
-import com.sendora.sdk.internal.*
+import com.sendoracloud.sdk.internal.*
 import kotlinx.coroutines.*
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -15,7 +15,11 @@ import java.util.TimeZone
 import java.util.UUID
 
 /**
- * Sendora Android SDK — deep linking, attribution, event tracking.
+ * SendoraCloud Android SDK — deep linking, attribution, event tracking.
+ *
+ * Key format: `pk_prod_*`, `pk_staging_*`, `pk_dev_*` — the key's env
+ * is server-enforced on ingest (ADR-014). Legacy `pk_live_*` keys are
+ * still accepted and treated as prod for backward compat.
  *
  * Security
  *  - Secret (`sk_`) keys are refused at init.
@@ -25,8 +29,8 @@ import java.util.UUID
  *  - User ID + device ID live in `EncryptedSharedPreferences`. Event queue
  *    on disk is PII-stripped.
  */
-object Sendora {
-    private var config: SendoraConfig? = null
+object SendoraCloud {
+    private var config: SendoraCloudConfig? = null
     private var apiClient: ApiClient? = null
     private var storage: Storage? = null
     private var eventQueue: EventQueue? = null
@@ -37,10 +41,10 @@ object Sendora {
     private var isConfigured = false
 
     /** Consent gate. Events queue but do not send until granted. */
-    val consent: SendoraConsent = SendoraConsent(false)
+    val consent: SendoraCloudConsent = SendoraCloudConsent(false)
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob() + CoroutineExceptionHandler { _, e ->
-        SendoraLogger.error("Coroutine error", e)
+        SendoraCloudLogger.error("Coroutine error", e)
     })
 
     private val isoFormatter = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
@@ -48,24 +52,24 @@ object Sendora {
     }
 
     /** Initialize. Call once from Application.onCreate. */
-    fun init(context: Context, apiKey: String, projectId: String, options: SendoraConfig? = null) {
+    fun init(context: Context, apiKey: String, projectId: String, options: SendoraCloudConfig? = null) {
         val appContext = context.applicationContext
-        val cfg = options ?: SendoraConfig(apiKey = apiKey, projectId = projectId)
+        val cfg = options ?: SendoraCloudConfig(apiKey = apiKey, projectId = projectId)
         val finalConfig = cfg.copy(
             apiKey = cfg.apiKey.ifEmpty { apiKey },
             projectId = cfg.projectId.ifEmpty { projectId },
         )
 
         try {
-            SendoraValidator.validateApiKey(finalConfig.apiKey)
-            SendoraValidator.validateApiUrl(finalConfig.apiBaseUrl)
+            SendoraCloudValidator.validateApiKey(finalConfig.apiKey)
+            SendoraCloudValidator.validateApiUrl(finalConfig.apiBaseUrl)
         } catch (e: SendoraError) {
-            SendoraLogger.error(e.message ?: "invalid config")
+            SendoraCloudLogger.error(e.message ?: "invalid config")
             return
         }
 
         config = finalConfig
-        SendoraLogger.isEnabled = finalConfig.debug
+        SendoraCloudLogger.isEnabled = finalConfig.debug
 
         if (finalConfig.defaultConsent) consent.grant()
 
@@ -93,7 +97,7 @@ object Sendora {
             if (granted) scope.launch { eventQueue?.flush() }
         }
 
-        SendoraLogger.debug("Configured — project: $projectId")
+        SendoraCloudLogger.debug("Configured — project: $projectId")
 
         if (finalConfig.autoStartAttribution) {
             scope.launch {
@@ -124,18 +128,18 @@ object Sendora {
         }
     }
 
-    fun handleDeepLink(intent: Intent): SendoraLinkData? {
+    fun handleDeepLink(intent: Intent): SendoraCloudLinkData? {
         if (!isConfigured) return null
         val uri = intent.data ?: return null
         return parseDeepLink(uri)
     }
 
-    fun handleDeepLink(uri: Uri): SendoraLinkData? {
+    fun handleDeepLink(uri: Uri): SendoraCloudLinkData? {
         if (!isConfigured) return null
         return parseDeepLink(uri)
     }
 
-    fun checkDeferredDeepLink(callback: (SendoraLinkData?) -> Unit) {
+    fun checkDeferredDeepLink(callback: (SendoraCloudLinkData?) -> Unit) {
         val cfg = config
         val store = storage
         val client = apiClient
@@ -153,7 +157,7 @@ object Sendora {
             val linkDataMap = (data?.get("deepLinkData") as? Map<String, Any>) ?: emptyMap()
             withContext(Dispatchers.Main) {
                 if (found) {
-                    callback(SendoraLinkData(
+                    callback(SendoraCloudLinkData(
                         shortcode = "",
                         deepLinkPath = data?.get("deepLinkPath") as? String,
                         campaign = data?.get("campaign") as? String,
@@ -172,10 +176,10 @@ object Sendora {
         if (!isConfigured) return
         val cfg = config ?: return
         try {
-            SendoraValidator.validateEventName(name)
-            SendoraValidator.validateProperties(properties)
+            SendoraCloudValidator.validateEventName(name)
+            SendoraCloudValidator.validateProperties(properties)
         } catch (e: SendoraError) {
-            SendoraLogger.error(e.message ?: "invalid event")
+            SendoraCloudLogger.error(e.message ?: "invalid event")
             return
         }
 
@@ -197,10 +201,10 @@ object Sendora {
         scope.launch { eventQueue?.add(event) }
     }
 
-    fun identify(userId: String, traits: Map<String, Any>? = null, options: SendoraIdentifyOptions? = null) {
+    fun identify(userId: String, traits: Map<String, Any>? = null, options: SendoraCloudIdentifyOptions? = null) {
         if (!isConfigured) return
         if (userId.isEmpty() || userId.length > 256) {
-            SendoraLogger.error("userId must be 1-256 chars")
+            SendoraCloudLogger.error("userId must be 1-256 chars")
             return
         }
         currentUserId = userId
@@ -220,7 +224,7 @@ object Sendora {
 
     // --- Private ---
 
-    private fun parseDeepLink(uri: Uri): SendoraLinkData? {
+    private fun parseDeepLink(uri: Uri): SendoraCloudLinkData? {
         val cfg = config ?: return null
         val host = uri.host?.lowercase() ?: return null
         val allowed = cfg.linkHosts.any { host == it || host.endsWith(".$it") }
@@ -236,7 +240,7 @@ object Sendora {
         if (!shortcode.matches(Regex("^[A-Za-z0-9_-]+$"))) return null
 
         trackEvent("links.opened", mapOf("shortcode" to shortcode))
-        return SendoraLinkData(shortcode = shortcode)
+        return SendoraCloudLinkData(shortcode = shortcode)
     }
 
     private suspend fun reportInstallIfNeeded() {

@@ -1,11 +1,11 @@
 plugins {
-    id("com.android.library") version "8.2.2"
-    id("org.jetbrains.kotlin.android") version "1.9.22"
+    id("com.android.library")
+    id("org.jetbrains.kotlin.android")
     id("maven-publish")
 }
 
 android {
-    namespace = "com.sendora.sdk"
+    namespace = "com.sendoracloud.sdk"
     compileSdk = 34
     defaultConfig {
         minSdk = 26
@@ -40,9 +40,9 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.sendoracloud"
                 artifactId = "sdk-android"
-                version = "1.0.0"
+                version = "2.0.0"
                 pom {
-                    name.set("Sendora Android SDK")
+                    name.set("Sendora Cloud Android SDK")
                     description.set("Deep linking, attribution, and event tracking for Android.")
                     url.set("https://sendoracloud.com/sdks")
                     licenses {

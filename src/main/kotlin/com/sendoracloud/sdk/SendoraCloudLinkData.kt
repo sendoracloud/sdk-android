@@ -1,9 +1,9 @@
-package com.sendora.sdk
+package com.sendoracloud.sdk
 
 /**
- * Data returned when a Sendora deep link is handled.
+ * Data returned when a SendoraCloud deep link is handled.
  */
-data class SendoraLinkData(
+data class SendoraCloudLinkData(
     val shortcode: String,
     val deepLinkPath: String? = null,
     val fallbackUrl: String? = null,

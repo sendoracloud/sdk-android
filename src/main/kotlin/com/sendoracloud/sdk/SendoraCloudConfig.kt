@@ -1,7 +1,7 @@
-package com.sendora.sdk
+package com.sendoracloud.sdk
 
-/** Configuration for the Sendora SDK. */
-data class SendoraConfig(
+/** Configuration for the SendoraCloud SDK. */
+data class SendoraCloudConfig(
     val apiKey: String,
     val projectId: String,
     val apiBaseUrl: String = "https://api.sendoracloud.com",
@@ -13,7 +13,7 @@ data class SendoraConfig(
     val linkHosts: List<String> = listOf("sendoracloud.com"),
     /**
      * When false (default), analytics events are buffered until
-     * `Sendora.consent.grant()` is called. Flip to true if you've already
+     * `SendoraCloud.consent.grant()` is called. Flip to true if you've already
      * gathered consent outside the SDK.
      */
     val defaultConsent: Boolean = false,
@@ -25,7 +25,7 @@ data class SendoraConfig(
 )
 
 /** HMAC identity-token options for `identify()`. */
-data class SendoraIdentifyOptions(
+data class SendoraCloudIdentifyOptions(
     /**
      * HMAC of `userId` signed by your backend with your server-side secret.
      * Required when the project is in strict-identity mode — the backend

@@ -1,6 +1,6 @@
-# Sendora Android SDK
+# SendoraCloud Android SDK
 
-Official Sendora Android SDK — deep linking, attribution, event tracking. Kotlin, minSdk 26.
+Official SendoraCloud Android SDK — deep linking, attribution, event tracking. Kotlin, minSdk 26.
 
 Full docs: [sendoracloud.com/sdks](https://sendoracloud.com/sdks)
 
@@ -29,25 +29,25 @@ dependencies {
 
 ```kotlin
 // Application.onCreate
-Sendora.init(this, apiKey = "pk_live_...", projectId = "<uuid>")
+SendoraCloud.init(this, apiKey = "pk_live_...", projectId = "<uuid>")
 
 // Grant consent (GDPR / ePrivacy). Events buffer until this is called.
-Sendora.consent.grant()
+SendoraCloud.consent.grant()
 
 // Identify with HMAC identity token signed by your backend
-Sendora.identify(
+SendoraCloud.identify(
     userId = "user_123",
     traits = mapOf("email" to "user@example.com"),
     options = SendoraIdentifyOptions(identityToken = "<HMAC>"),
 )
 
 // Track a custom event
-Sendora.trackEvent("purchase", mapOf("amount" to 29.99))
+SendoraCloud.trackEvent("purchase", mapOf("amount" to 29.99))
 
 // Deep link handling
 override fun onNewIntent(intent: Intent) {
     super.onNewIntent(intent)
-    Sendora.handleDeepLink(intent)?.let { link ->
+    SendoraCloud.handleDeepLink(intent)?.let { link ->
         // route to link.deepLinkPath
     }
 }
@@ -79,4 +79,4 @@ Merge the included rules with your own:
 
 ## License
 
-Apache-2.0 © Sendora
+Apache-2.0 © SendoraCloud

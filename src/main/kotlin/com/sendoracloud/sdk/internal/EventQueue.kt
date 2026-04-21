@@ -1,4 +1,4 @@
-package com.sendora.sdk.internal
+package com.sendoracloud.sdk.internal
 
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
@@ -23,7 +23,7 @@ internal class EventQueue(
         val persisted = storage.loadEventQueue()
         if (persisted.isNotEmpty()) {
             events.addAll(persisted)
-            SendoraLogger.debug("Loaded ${persisted.size} persisted events")
+            SendoraCloudLogger.debug("Loaded ${persisted.size} persisted events")
         }
     }
 
@@ -65,7 +65,7 @@ internal class EventQueue(
     suspend fun persistToDisk() {
         mutex.withLock {
             storage.saveEventQueue(events.toList())
-            SendoraLogger.debug("Persisted ${events.size} events to disk")
+            SendoraCloudLogger.debug("Persisted ${events.size} events to disk")
         }
     }
 
@@ -74,7 +74,7 @@ internal class EventQueue(
         val batch = events.toList()
         events.clear()
         storage.clearEventQueue()
-        SendoraLogger.debug("Flushing ${batch.size} events")
+        SendoraCloudLogger.debug("Flushing ${batch.size} events")
         flushHandler?.invoke(batch)
     }
 

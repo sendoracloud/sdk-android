@@ -1,6 +1,6 @@
-package com.sendora.sdk
+package com.sendoracloud.sdk
 
-sealed class SendoraError(message: String) : IllegalArgumentException("[Sendora] $message") {
+sealed class SendoraError(message: String) : IllegalArgumentException("[SendoraCloud] $message") {
     class InvalidApiKey(msg: String) : SendoraError(msg)
     class InvalidApiUrl(msg: String) : SendoraError(msg)
     class InvalidEventName(name: String) : SendoraError("invalid event name: $name")
@@ -9,7 +9,7 @@ sealed class SendoraError(message: String) : IllegalArgumentException("[Sendora]
     class ForbiddenKey(key: String) : SendoraError("forbidden property key: $key")
 }
 
-internal object SendoraValidator {
+internal object SendoraCloudValidator {
     private val keyRegex = Regex("^pk_[A-Za-z0-9_-]{16,}$")
     private val eventRegex = Regex("^[a-zA-Z][a-zA-Z0-9._:\\-]{0,127}$")
     private const val MAX_BYTES = 32 * 1024
