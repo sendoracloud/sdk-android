@@ -77,6 +77,41 @@ internal class Storage(context: Context) {
         securePrefs.edit().remove("device_id").apply()
     }
 
+    // --- Auth Service tokens (EncryptedSharedPreferences) ---
+
+    var authAccessToken: String?
+        get() = securePrefs.getString("auth_access_token", null)
+        set(value) {
+            val e = securePrefs.edit()
+            if (value != null) e.putString("auth_access_token", value) else e.remove("auth_access_token")
+            e.apply()
+        }
+
+    var authRefreshToken: String?
+        get() = securePrefs.getString("auth_refresh_token", null)
+        set(value) {
+            val e = securePrefs.edit()
+            if (value != null) e.putString("auth_refresh_token", value) else e.remove("auth_refresh_token")
+            e.apply()
+        }
+
+    /** JSON-encoded `AuthUser`. Decoded by SendoraCloudAuth. */
+    var authUserJson: String?
+        get() = securePrefs.getString("auth_user", null)
+        set(value) {
+            val e = securePrefs.edit()
+            if (value != null) e.putString("auth_user", value) else e.remove("auth_user")
+            e.apply()
+        }
+
+    fun clearAuthTokens() {
+        securePrefs.edit()
+            .remove("auth_access_token")
+            .remove("auth_refresh_token")
+            .remove("auth_user")
+            .apply()
+    }
+
     fun saveEventQueue(events: List<Map<String, Any?>>) {
         try {
             val jsonArray = JSONArray()

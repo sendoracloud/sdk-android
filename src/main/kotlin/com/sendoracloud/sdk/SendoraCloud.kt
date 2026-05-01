@@ -43,6 +43,10 @@ object SendoraCloud {
     /** Consent gate. Events queue but do not send until granted. */
     val consent: SendoraCloudConsent = SendoraCloudConsent(false)
 
+    /** Auth Service surface. Initialised in `init()`. */
+    var auth: SendoraCloudAuth? = null
+        private set
+
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob() + CoroutineExceptionHandler { _, e ->
         SendoraCloudLogger.error("Coroutine error", e)
     })
@@ -91,6 +95,26 @@ object SendoraCloud {
         }
         queue.startTimer(finalConfig.flushInterval)
         eventQueue = queue
+
+        auth = SendoraCloudAuth(
+            client = client,
+            storage = store,
+            onIdentityChange = { userId ->
+                currentUserId = userId
+                store.cachedUserId = userId
+            },
+            onAnonymousWipe = {
+                // Switching from anonymous to a real account —
+                // rotate the device-side identity so events from
+                // the new user can't carry over the prior anonymous
+                // attribution.
+                currentUserId = null
+                currentIdentityToken = null
+                store.cachedUserId = null
+                store.regenerateDeviceId()
+                store.sessionId = UUID.randomUUID().toString()
+            },
+        )
 
         isConfigured = true
         consent.subscribe { granted ->
