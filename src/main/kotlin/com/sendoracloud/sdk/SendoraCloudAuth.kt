@@ -3,6 +3,12 @@ package com.sendoracloud.sdk
 import com.sendoracloud.sdk.internal.ApiClient
 import com.sendoracloud.sdk.internal.SendoraCloudLogger
 import com.sendoracloud.sdk.internal.Storage
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 
 /**
@@ -15,13 +21,22 @@ import org.json.JSONObject
  *                                  session; otherwise creates a
  *                                  fresh account.
  *   - signIn(email, password)    — logs into an existing account.
- *                                  If the SDK was anonymous, local
- *                                  identity is wiped first.
- *   - signOut()                  — best-effort revoke + wipe.
+ *                                  Local identity is wiped FIRST so
+ *                                  any track() during the round-trip
+ *                                  can't attach to the prior identity.
+ *   - signOut()                  — wipe FIRST, fire-and-forget revoke.
+ *                                  User is logged out on device even
+ *                                  if the network call hangs.
  *
- * Tokens persist in EncryptedSharedPreferences via Storage. On
- * SDK init the session is re-hydrated so a cold launch keeps the
- * active user.
+ * All public ops are serialized through a single Mutex so a UI
+ * double-submit can't mint two anonymous users or interleave a
+ * signIn + signOut. Response payloads are validated non-empty
+ * before persisting — a malformed/MitM'd response can't install an
+ * `id = ""` user.
+ *
+ * Tokens persist in `EncryptedSharedPreferences` only. If secure
+ * storage is unavailable, persistence FAILS instead of falling back
+ * to plaintext SharedPreferences.
  */
 
 data class SendoraCloudAuthUser(
@@ -36,6 +51,7 @@ sealed class SendoraCloudAuthError(message: String) : Throwable(message) {
     class EmailAlreadyTaken(message: String) : SendoraCloudAuthError(message)
     class Unauthorized(message: String) : SendoraCloudAuthError(message)
     class Network(message: String) : SendoraCloudAuthError(message)
+    class SecureStorageUnavailable(message: String) : SendoraCloudAuthError(message)
     class Unknown(message: String) : SendoraCloudAuthError(message)
 }
 
@@ -43,38 +59,70 @@ class SendoraCloudAuth internal constructor(
     private val client: ApiClient,
     private val storage: Storage,
     private val onIdentityChange: (String?) -> Unit,
-    private val onAnonymousWipe: () -> Unit,
+    private val onAnonymousWipe: suspend () -> Unit,
 ) {
     @Volatile private var cachedUser: SendoraCloudAuthUser? = null
+    @Volatile private var cachedExpiresAt: Long = 0L
+    private val mutex = Mutex()
+    private val refreshMutex = Mutex()
+    private val refreshSafetyMs = 30_000L
 
     init {
-        // Re-hydrate session from EncryptedSharedPreferences.
+        // Re-hydrate session from EncryptedSharedPreferences. Drop the
+        // cache if the JSON is malformed or carries an empty id —
+        // either signal corruption / a forged write.
         storage.authUserJson?.let { json ->
             runCatching {
                 val obj = JSONObject(json)
-                cachedUser = SendoraCloudAuthUser(
-                    id = obj.optString("id"),
-                    email = obj.opt("email")?.takeIf { it != JSONObject.NULL } as? String,
-                    emailVerified = obj.optBoolean("emailVerified", false),
-                    name = obj.opt("name")?.takeIf { it != JSONObject.NULL } as? String,
-                    isAnonymous = obj.optBoolean("isAnonymous", false),
-                )
-                cachedUser?.let { onIdentityChange(it.id) }
-            }
+                val id = obj.optString("id")
+                if (id.isNotEmpty()) {
+                    cachedUser = SendoraCloudAuthUser(
+                        id = id,
+                        email = obj.opt("email")?.takeIf { it != JSONObject.NULL } as? String,
+                        emailVerified = obj.optBoolean("emailVerified", false),
+                        name = obj.opt("name")?.takeIf { it != JSONObject.NULL } as? String,
+                        isAnonymous = obj.optBoolean("isAnonymous", false),
+                    )
+                    cachedExpiresAt = storage.authAccessExpiresAt
+                    cachedUser?.let { onIdentityChange(it.id) }
+                } else {
+                    storage.clearAuthTokens()
+                }
+            }.onFailure { storage.clearAuthTokens() }
         }
     }
 
     val currentUser: SendoraCloudAuthUser? get() = cachedUser
+
+    /** Synchronous read — returns whatever's cached, even if expired.
+     *  Prefer `getAccessToken()` for transparent refresh. */
     val accessToken: String? get() = storage.authAccessToken
+
+    /**
+     * Returns a non-expired access token. Triggers a single-flight
+     * refresh if the cached token is past expiry.
+     */
+    suspend fun getAccessToken(): String? {
+        val token = storage.authAccessToken ?: return null
+        val exp = cachedExpiresAt
+        val nowMs = System.currentTimeMillis()
+        if (exp > 0 && nowMs < exp - refreshSafetyMs) return token
+        return refreshAccessToken()
+    }
 
     suspend fun signInAnonymously(
         name: String? = null,
         metadata: Map<String, Any>? = null,
-    ): Result<SendoraCloudAuthUser> {
+    ): Result<SendoraCloudAuthUser> = mutex.withLock {
+        if (!storage.isSecureAvailable) {
+            return@withLock Result.failure(SendoraCloudAuthError.SecureStorageUnavailable(
+                "EncryptedSharedPreferences unavailable — refusing to mint a session that can't be persisted securely"
+            ))
+        }
         val body = mutableMapOf<String, Any?>()
         name?.let { body["name"] = it }
         metadata?.let { body["metadata"] = it }
-        return callAuth("/auth-service/anonymous", body)
+        callAuth("/auth-service/anonymous", body)
     }
 
     suspend fun signUp(
@@ -82,8 +130,13 @@ class SendoraCloudAuth internal constructor(
         password: String,
         name: String? = null,
         metadata: Map<String, Any>? = null,
-    ): Result<SendoraCloudAuthUser> {
-        val isAnonymous = currentUser?.isAnonymous == true
+    ): Result<SendoraCloudAuthUser> = mutex.withLock {
+        if (!storage.isSecureAvailable) {
+            return@withLock Result.failure(SendoraCloudAuthError.SecureStorageUnavailable(
+                "EncryptedSharedPreferences unavailable — refusing to persist auth tokens"
+            ))
+        }
+        val isAnonymous = cachedUser?.isAnonymous == true
         val refresh = storage.authRefreshToken
         if (isAnonymous && refresh != null) {
             val body = mutableMapOf<String, Any?>(
@@ -92,34 +145,54 @@ class SendoraCloudAuth internal constructor(
                 "password" to password,
             )
             name?.let { body["name"] = it }
-            return callAuth("/auth-service/upgrade", body)
+            return@withLock callAuth("/auth-service/upgrade", body)
+        }
+        // Non-anonymous identified state — wipe BEFORE the network call
+        // so any track() during the auth round-trip can't attach to
+        // the prior identity.
+        if (cachedUser != null && cachedUser?.isAnonymous == false) {
+            wipeLocalIdentity()
         }
         val body = mutableMapOf<String, Any?>("email" to email, "password" to password)
         name?.let { body["name"] = it }
         metadata?.let { body["metadata"] = it }
-        return callAuth("/auth-service/signup", body)
+        callAuth("/auth-service/signup", body)
     }
 
-    suspend fun signIn(email: String, password: String): Result<SendoraCloudAuthUser> {
-        val wasAnonymous = currentUser?.isAnonymous == true
+    suspend fun signIn(email: String, password: String): Result<SendoraCloudAuthUser> = mutex.withLock {
+        if (!storage.isSecureAvailable) {
+            return@withLock Result.failure(SendoraCloudAuthError.SecureStorageUnavailable(
+                "EncryptedSharedPreferences unavailable — refusing to persist auth tokens"
+            ))
+        }
+        // Wipe BEFORE the network call so any track() during the auth
+        // round-trip can't attach to the prior identity (TOCTOU).
+        if (cachedUser != null) wipeLocalIdentity()
+
         val response = client.post("/auth-service/login", mapOf("email" to email, "password" to password))
         val err = parseError(response)
-        if (err != null) return Result.failure(err)
-        val (user, _) = parseSuccess(response)
-            ?: return Result.failure(SendoraCloudAuthError.Unknown("Malformed response"))
-        if (wasAnonymous) wipeLocalIdentity()
+        if (err != null) return@withLock Result.failure(err)
+        val parsed = parseSuccess(response)
+            ?: return@withLock Result.failure(SendoraCloudAuthError.Unknown("Malformed response"))
         persist(response!!)
-        return Result.success(user)
+        Result.success(parsed.first)
     }
 
-    suspend fun signOut() {
+    suspend fun signOut() = mutex.withLock {
+        // Wipe FIRST so the user is logged out on device even if the
+        // revoke request hangs (airplane mode, 5xx, circuit open).
+        // Refresh token still expires server-side.
         val refresh = storage.authRefreshToken
-        if (refresh != null) {
-            runCatching {
-                client.post("/auth-service/token/revoke", mapOf("refreshToken" to refresh))
-            }.onFailure { SendoraCloudLogger.debug("signOut revoke best-effort failed: ${it.message}") }
-        }
         wipeLocalIdentity()
+        if (refresh != null) {
+            // Fire-and-forget on a detached scope so the local wipe
+            // is the user-visible outcome.
+            CoroutineScope(Dispatchers.IO + SupervisorJob()).launch {
+                runCatching {
+                    client.post("/auth-service/token/revoke", mapOf("refreshToken" to refresh))
+                }
+            }
+        }
     }
 
     // --- Internals ---
@@ -135,6 +208,32 @@ class SendoraCloudAuth internal constructor(
             ?: return Result.failure(SendoraCloudAuthError.Unknown("Malformed response"))
         persist(response!!)
         return Result.success(parsed.first)
+    }
+
+    private suspend fun refreshAccessToken(): String? = refreshMutex.withLock {
+        val nowMs = System.currentTimeMillis()
+        // Re-check after acquiring the lock; another caller may have
+        // already refreshed.
+        val exp = cachedExpiresAt
+        val cached = storage.authAccessToken
+        if (cached != null && exp > 0 && nowMs < exp - refreshSafetyMs) return@withLock cached
+
+        val refresh = storage.authRefreshToken ?: return@withLock null
+        val response = client.post("/auth-service/token/refresh", mapOf("refreshToken" to refresh))
+        @Suppress("UNCHECKED_CAST")
+        val data = response?.get("data") as? Map<String, Any?> ?: return@withLock null
+        val accessToken = data["accessToken"] as? String
+        val refreshToken = data["refreshToken"] as? String
+        val expiresIn = (data["expiresIn"] as? Number)?.toLong()
+        if (accessToken.isNullOrEmpty() || refreshToken.isNullOrEmpty() || expiresIn == null || expiresIn <= 0) {
+            return@withLock null
+        }
+        val newExp = nowMs + expiresIn * 1000L
+        storage.authAccessToken = accessToken
+        storage.authRefreshToken = refreshToken
+        storage.authAccessExpiresAt = newExp
+        cachedExpiresAt = newExp
+        accessToken
     }
 
     private fun parseError(response: Map<String, Any?>?): SendoraCloudAuthError? {
@@ -157,8 +256,14 @@ class SendoraCloudAuth internal constructor(
         val data = response?.get("data") as? Map<String, Any?> ?: return null
         val userMap = data["user"] as? Map<String, Any?> ?: return null
         val tokensMap = data["tokens"] as? Map<String, Any?> ?: return null
+        val id = userMap["id"] as? String
+        if (id.isNullOrEmpty()) return null
+        val accessToken = tokensMap["accessToken"] as? String
+        val refreshToken = tokensMap["refreshToken"] as? String
+        val expiresIn = (tokensMap["expiresIn"] as? Number)?.toLong() ?: 0L
+        if (accessToken.isNullOrEmpty() || refreshToken.isNullOrEmpty() || expiresIn <= 0) return null
         val user = SendoraCloudAuthUser(
-            id = userMap["id"] as? String ?: "",
+            id = id,
             email = userMap["email"] as? String,
             emailVerified = userMap["emailVerified"] as? Boolean ?: false,
             name = userMap["name"] as? String,
@@ -169,9 +274,16 @@ class SendoraCloudAuth internal constructor(
 
     private fun persist(response: Map<String, Any?>) {
         val (user, tokens) = parseSuccess(response) ?: return
+        val accessToken = tokens["accessToken"] as String
+        val refreshToken = tokens["refreshToken"] as String
+        val expiresIn = (tokens["expiresIn"] as Number).toLong()
+        val expMs = System.currentTimeMillis() + expiresIn * 1000L
+
         cachedUser = user
-        storage.authAccessToken = tokens["accessToken"] as? String ?: ""
-        storage.authRefreshToken = tokens["refreshToken"] as? String ?: ""
+        cachedExpiresAt = expMs
+        storage.authAccessToken = accessToken
+        storage.authRefreshToken = refreshToken
+        storage.authAccessExpiresAt = expMs
         val userJson = JSONObject().apply {
             put("id", user.id)
             put("email", user.email ?: JSONObject.NULL)
@@ -183,8 +295,9 @@ class SendoraCloudAuth internal constructor(
         onIdentityChange(user.id)
     }
 
-    private fun wipeLocalIdentity() {
+    private suspend fun wipeLocalIdentity() {
         cachedUser = null
+        cachedExpiresAt = 0L
         storage.clearAuthTokens()
         onAnonymousWipe()
     }

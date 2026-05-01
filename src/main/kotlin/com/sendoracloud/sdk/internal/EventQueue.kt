@@ -62,6 +62,18 @@ internal class EventQueue(
         mutex.withLock { performFlush() }
     }
 
+    /**
+     * Discard every queued event without flushing. Used by Auth on
+     * cross-account signin so the prior identity's pending events
+     * don't surface under the next user.
+     */
+    suspend fun dropAll() {
+        mutex.withLock {
+            events.clear()
+            storage.clearEventQueue()
+        }
+    }
+
     suspend fun persistToDisk() {
         mutex.withLock {
             storage.saveEventQueue(events.toList())

@@ -85,7 +85,7 @@ object SendoraCloud {
         deviceContext = device
         fingerprintHash = FingerprintGenerator.generate(device)
 
-        val client = ApiClient(finalConfig.apiBaseUrl, finalConfig.apiKey)
+        val client = ApiClient(finalConfig.apiBaseUrl, finalConfig.apiKey, finalConfig.pinnedSPKIHashes)
         apiClient = client
 
         val queue = EventQueue(store, finalConfig.flushAt, finalConfig.maxQueueSize)
@@ -104,15 +104,22 @@ object SendoraCloud {
                 store.cachedUserId = userId
             },
             onAnonymousWipe = {
-                // Switching from anonymous to a real account —
-                // rotate the device-side identity so events from
-                // the new user can't carry over the prior anonymous
-                // attribution.
+                // Switching identities — rotate device-side state so
+                // events from the new user can't carry over the prior
+                // anonymous attribution. Also drain the event queue:
+                // pending events were captured under the prior
+                // currentUserId and shouldn't surface under the next.
                 currentUserId = null
                 currentIdentityToken = null
                 store.cachedUserId = null
                 store.regenerateDeviceId()
+                // Force-mint a fresh device id immediately so any
+                // concurrent track() that races the wipe sees the
+                // new id rather than a transiently missing one.
+                @Suppress("UNUSED_VARIABLE")
+                val _force = store.deviceId
                 store.sessionId = UUID.randomUUID().toString()
+                eventQueue?.dropAll()
             },
         )
 
@@ -215,7 +222,7 @@ object SendoraCloud {
             put("properties", properties ?: emptyMap<String, Any>())
             put("context", mapOf(
                 "device" to (deviceContext?.toMap() ?: emptyMap()),
-                "sdk" to mapOf("name" to "sendora-android", "version" to "1.0.0"),
+                "sdk" to mapOf("name" to "sendora-android", "version" to "2.2.0"),
             ))
             put("sessionId", storage?.sessionId ?: "")
             put("consent", listOf("analytics"))
@@ -230,6 +237,17 @@ object SendoraCloud {
         if (userId.isEmpty() || userId.length > 256) {
             SendoraCloudLogger.error("userId must be 1-256 chars")
             return
+        }
+        if (traits != null) {
+            // Cap traits payload at 32 KB serialized — same bound
+            // sdk-web + sdk-react-native enforce. Prevents an
+            // in-app actor from DoSing ingest with deeply nested
+            // / large objects.
+            val bytes = JSONObject(traits).toString().toByteArray(Charsets.UTF_8).size
+            if (bytes > 32 * 1024) {
+                SendoraCloudLogger.error("traits exceed 32 KB")
+                return
+            }
         }
         currentUserId = userId
         currentIdentityToken = options?.identityToken

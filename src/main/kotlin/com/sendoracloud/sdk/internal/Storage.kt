@@ -11,16 +11,27 @@ import java.util.UUID
 /**
  * Persistent storage.
  *  - Non-sensitive (`isFirstLaunch`, `sessionId`) lives in plain SharedPreferences.
- *  - `cachedUserId` + `deviceId` live in EncryptedSharedPreferences (AES256-GCM,
- *    key stored in AndroidKeyStore).
+ *  - `cachedUserId` + `deviceId` + auth tokens live in EncryptedSharedPreferences
+ *    (AES256-GCM, key stored in AndroidKeyStore).
  *  - Event queue persisted with `userId` + `traits` stripped — they'll be
  *    re-injected from `currentUserId` at send time.
+ *
+ * **Critical:** if EncryptedSharedPreferences cannot be initialised (corrupt
+ * Keystore, missing AndroidX dep), token writes are REFUSED rather than
+ * silently downgraded to plaintext SharedPreferences. The previous fallback
+ * exposed access + refresh tokens in cleartext on disk — full account
+ * takeover on rooted devices or via post-uninstall data extraction.
  */
 internal class Storage(context: Context) {
     private val prefs: SharedPreferences =
         context.getSharedPreferences("sendora_sdk", Context.MODE_PRIVATE)
 
-    private val securePrefs: SharedPreferences = runCatching {
+    /**
+     * Null when secure storage is unavailable. Every secure getter/setter
+     * checks this and refuses the operation if null — token persistence
+     * fails closed instead of degrading to plaintext.
+     */
+    private val securePrefs: SharedPreferences? = runCatching {
         val master = MasterKey.Builder(context)
             .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
             .build()
@@ -31,12 +42,17 @@ internal class Storage(context: Context) {
             EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
         )
-    }.getOrElse {
-        // Fall back to plain prefs if Keystore is unavailable (very rare;
-        // typically only on corrupt devices). Data still scoped to our app.
-        SendoraCloudLogger.error("EncryptedSharedPreferences unavailable — falling back", it)
-        prefs
+    }.getOrElse { err ->
+        SendoraCloudLogger.error(
+            "EncryptedSharedPreferences init failed — auth tokens will not persist. Refusing plaintext fallback.",
+            err,
+        )
+        null
     }
+
+    /** True when secure storage is available. Auth.signIn etc. should
+     *  surface a configuration error to the consumer if false. */
+    val isSecureAvailable: Boolean get() = securePrefs != null
 
     var isFirstLaunch: Boolean
         get() = !prefs.getBoolean("launched", false)
@@ -57,59 +73,94 @@ internal class Storage(context: Context) {
         }
 
     var cachedUserId: String?
-        get() = securePrefs.getString("user_id", null)
+        get() = securePrefs?.getString("user_id", null)
         set(value) {
-            val e = securePrefs.edit()
+            val sp = securePrefs ?: return
+            val e = sp.edit()
             if (value != null) e.putString("user_id", value) else e.remove("user_id")
             e.apply()
         }
 
     val deviceId: String
         get() = synchronized(_sessionLock) {
-            val existing = securePrefs.getString("device_id", null)
+            val sp = securePrefs
+            if (sp == null) {
+                // Cannot persist — return a per-process random id so
+                // events still have a stable id within the process,
+                // but log loudly so the developer notices.
+                SendoraCloudLogger.error("deviceId requested but secure storage unavailable; returning ephemeral id")
+                return UUID.randomUUID().toString()
+            }
+            val existing = sp.getString("device_id", null)
             if (existing != null) return existing
             val newId = UUID.randomUUID().toString()
-            securePrefs.edit().putString("device_id", newId).apply()
+            sp.edit().putString("device_id", newId).apply()
             newId
         }
 
     fun regenerateDeviceId() {
-        securePrefs.edit().remove("device_id").apply()
+        securePrefs?.edit()?.remove("device_id")?.apply()
     }
 
-    // --- Auth Service tokens (EncryptedSharedPreferences) ---
+    // --- Auth Service tokens (EncryptedSharedPreferences ONLY) ---
 
     var authAccessToken: String?
-        get() = securePrefs.getString("auth_access_token", null)
+        get() = securePrefs?.getString("auth_access_token", null)
         set(value) {
-            val e = securePrefs.edit()
+            val sp = securePrefs
+            if (sp == null) {
+                SendoraCloudLogger.error("Refusing to persist auth token — secure storage unavailable")
+                return
+            }
+            val e = sp.edit()
             if (value != null) e.putString("auth_access_token", value) else e.remove("auth_access_token")
             e.apply()
         }
 
     var authRefreshToken: String?
-        get() = securePrefs.getString("auth_refresh_token", null)
+        get() = securePrefs?.getString("auth_refresh_token", null)
         set(value) {
-            val e = securePrefs.edit()
+            val sp = securePrefs
+            if (sp == null) {
+                SendoraCloudLogger.error("Refusing to persist refresh token — secure storage unavailable")
+                return
+            }
+            val e = sp.edit()
             if (value != null) e.putString("auth_refresh_token", value) else e.remove("auth_refresh_token")
+            e.apply()
+        }
+
+    /** Unix-millis when the cached access token expires. 0 = unknown. */
+    var authAccessExpiresAt: Long
+        get() = securePrefs?.getLong("auth_access_expires", 0L) ?: 0L
+        set(value) {
+            val sp = securePrefs ?: return
+            val e = sp.edit()
+            if (value > 0) e.putLong("auth_access_expires", value) else e.remove("auth_access_expires")
             e.apply()
         }
 
     /** JSON-encoded `AuthUser`. Decoded by SendoraCloudAuth. */
     var authUserJson: String?
-        get() = securePrefs.getString("auth_user", null)
+        get() = securePrefs?.getString("auth_user", null)
         set(value) {
-            val e = securePrefs.edit()
+            val sp = securePrefs
+            if (sp == null) {
+                SendoraCloudLogger.error("Refusing to persist user record — secure storage unavailable")
+                return
+            }
+            val e = sp.edit()
             if (value != null) e.putString("auth_user", value) else e.remove("auth_user")
             e.apply()
         }
 
     fun clearAuthTokens() {
-        securePrefs.edit()
-            .remove("auth_access_token")
-            .remove("auth_refresh_token")
-            .remove("auth_user")
-            .apply()
+        securePrefs?.edit()
+            ?.remove("auth_access_token")
+            ?.remove("auth_access_expires")
+            ?.remove("auth_refresh_token")
+            ?.remove("auth_user")
+            ?.apply()
     }
 
     fun saveEventQueue(events: List<Map<String, Any?>>) {
