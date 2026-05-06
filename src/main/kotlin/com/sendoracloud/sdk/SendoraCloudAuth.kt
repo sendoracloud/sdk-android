@@ -252,6 +252,36 @@ class SendoraCloudAuth internal constructor(
         callAuth("/auth-service/email-otp/verify", mapOf("email" to email, "code" to code))
     }
 
+    // --- Password reset + email verification ---
+
+    /** Trigger a password-reset email. Backend always succeeds even when address is unknown (anti-enumeration). */
+    suspend fun requestPasswordReset(email: String): Result<Unit> {
+        val response = client.post("/auth-service/password/forgot", mapOf("email" to email))
+        return parseError(response)?.let { Result.failure(it) } ?: Result.success(Unit)
+    }
+
+    /** Pair the reset-email token with the user's new password. */
+    suspend fun resetPassword(token: String, newPassword: String): Result<Unit> {
+        val response = client.post(
+            "/auth-service/password/reset",
+            mapOf("token" to token, "newPassword" to newPassword),
+        )
+        return parseError(response)?.let { Result.failure(it) } ?: Result.success(Unit)
+    }
+
+    /** Verify the email-address token from the link Sendora sent on signup. */
+    suspend fun verifyEmail(token: String): Result<Unit> {
+        val response = client.post("/auth-service/email/verify", mapOf("token" to token))
+        return parseError(response)?.let { Result.failure(it) } ?: Result.success(Unit)
+    }
+
+    /** Re-send the email-verification email for the currently-signed-in user. No-op when already verified. */
+    suspend fun sendVerificationEmail(): Result<Unit> {
+        val headers = bearerHeaders() ?: return Result.failure(SendoraCloudAuthError.Unauthorized("Not signed in"))
+        val response = client.post("/auth-service/email/verify/resend", emptyMap(), headers)
+        return parseError(response)?.let { Result.failure(it) } ?: Result.success(Unit)
+    }
+
     // --- MFA enrollment management (Bearer-authenticated) ---
 
     data class MfaEnrollment(val secret: String, val otpauthUrl: String, val recoveryCodes: List<String>)
