@@ -29,6 +29,10 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.lifecycle:lifecycle-process:2.8.0")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    // Credential Manager — passkey register + authenticate (API 28+ at runtime;
+    // SDK keeps minSdk = 26 by gating Build.VERSION.SDK_INT in SendoraCloudPasskeys).
+    implementation("androidx.credentials:credentials:1.3.0")
+    implementation("androidx.credentials:credentials-play-services-auth:1.3.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
 }
@@ -40,7 +44,7 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.sendoracloud"
                 artifactId = "sdk-android"
-                version = "2.2.0"
+                version = "2.5.0"
                 pom {
                     name.set("Sendora Cloud Android SDK")
                     description.set("Deep linking, attribution, and event tracking for Android.")

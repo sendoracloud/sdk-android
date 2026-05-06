@@ -178,6 +178,155 @@ class SendoraCloudAuth internal constructor(
         Result.success(parsed.first)
     }
 
+    /**
+     * Login outcome — `Authenticated` for the standard path,
+     * `MfaRequired` when the account has MFA enabled. Caller follows
+     * up with `challengeMfa()` to mint the actual session.
+     */
+    sealed class SignInOutcome {
+        data class Authenticated(val user: SendoraCloudAuthUser) : SignInOutcome()
+        data class MfaRequired(val challengeToken: String, val userId: String) : SignInOutcome()
+    }
+
+    /**
+     * Like `signIn()` but discriminates the MFA-required path. Use this
+     * when supporting MFA on end-users.
+     */
+    suspend fun signInWithMfaSupport(email: String, password: String): Result<SignInOutcome> = mutex.withLock {
+        if (!storage.isSecureAvailable) {
+            return@withLock Result.failure(SendoraCloudAuthError.SecureStorageUnavailable("EncryptedSharedPreferences unavailable"))
+        }
+        if (cachedUser != null) wipeLocalIdentity()
+        val response = client.post("/auth-service/login", mapOf("email" to email, "password" to password))
+        val err = parseError(response)
+        if (err != null) return@withLock Result.failure(err)
+        @Suppress("UNCHECKED_CAST")
+        val data = response?.get("data") as? Map<String, Any?>
+            ?: return@withLock Result.failure(SendoraCloudAuthError.Unknown("Malformed response"))
+        if (data["mfaRequired"] == true) {
+            val challengeToken = data["mfaChallengeToken"] as? String
+                ?: return@withLock Result.failure(SendoraCloudAuthError.Unknown("Missing mfaChallengeToken"))
+            @Suppress("UNCHECKED_CAST")
+            val userMap = data["user"] as? Map<String, Any?>
+            val userId = (userMap?.get("id") as? String) ?: ""
+            return@withLock Result.success(SignInOutcome.MfaRequired(challengeToken, userId))
+        }
+        val parsed = parseSuccess(response)
+            ?: return@withLock Result.failure(SendoraCloudAuthError.Unknown("Malformed response"))
+        persist(response!!)
+        Result.success(SignInOutcome.Authenticated(parsed.first))
+    }
+
+    /** Exchange the MFA challenge token + TOTP/recovery code for a session. */
+    suspend fun challengeMfa(challengeToken: String, code: String): Result<SendoraCloudAuthUser> = mutex.withLock {
+        callAuth("/auth-service/mfa/challenge", mapOf("challengeToken" to challengeToken, "code" to code))
+    }
+
+    // --- Magic link ---
+
+    suspend fun sendMagicLink(email: String): Result<Unit> {
+        val response = client.post("/auth-service/magic-link/request", mapOf("email" to email))
+        return parseError(response)?.let { Result.failure(it) } ?: Result.success(Unit)
+    }
+
+    suspend fun verifyMagicLink(token: String): Result<SendoraCloudAuthUser> = mutex.withLock {
+        if (!storage.isSecureAvailable) {
+            return@withLock Result.failure(SendoraCloudAuthError.SecureStorageUnavailable("EncryptedSharedPreferences unavailable"))
+        }
+        if (cachedUser != null) wipeLocalIdentity()
+        callAuth("/auth-service/magic-link/verify", mapOf("token" to token))
+    }
+
+    // --- Email OTP (6-digit cross-device code) ---
+
+    suspend fun sendEmailOtp(email: String): Result<Unit> {
+        val response = client.post("/auth-service/email-otp/request", mapOf("email" to email))
+        return parseError(response)?.let { Result.failure(it) } ?: Result.success(Unit)
+    }
+
+    suspend fun verifyEmailOtp(email: String, code: String): Result<SendoraCloudAuthUser> = mutex.withLock {
+        if (!storage.isSecureAvailable) {
+            return@withLock Result.failure(SendoraCloudAuthError.SecureStorageUnavailable("EncryptedSharedPreferences unavailable"))
+        }
+        if (cachedUser != null) wipeLocalIdentity()
+        callAuth("/auth-service/email-otp/verify", mapOf("email" to email, "code" to code))
+    }
+
+    // --- MFA enrollment management (Bearer-authenticated) ---
+
+    data class MfaEnrollment(val secret: String, val otpauthUrl: String, val recoveryCodes: List<String>)
+
+    suspend fun enrollMfa(): Result<MfaEnrollment> {
+        val headers = bearerHeaders() ?: return Result.failure(SendoraCloudAuthError.Unauthorized("Not signed in"))
+        val response = client.post("/auth-service/mfa/enroll/start", emptyMap(), headers)
+        @Suppress("UNCHECKED_CAST")
+        val data = response?.get("data") as? Map<String, Any?>
+            ?: return Result.failure(SendoraCloudAuthError.Unknown("Malformed enrollment response"))
+        val secret = data["secret"] as? String
+        val url = data["otpauthUrl"] as? String
+        @Suppress("UNCHECKED_CAST")
+        val codes = (data["recoveryCodes"] as? List<String>) ?: emptyList()
+        if (secret.isNullOrEmpty() || url.isNullOrEmpty()) {
+            return Result.failure(SendoraCloudAuthError.Unknown("Malformed enrollment response"))
+        }
+        return Result.success(MfaEnrollment(secret, url, codes))
+    }
+
+    suspend fun confirmMfa(code: String): Result<Boolean> {
+        val headers = bearerHeaders() ?: return Result.failure(SendoraCloudAuthError.Unauthorized("Not signed in"))
+        val response = client.post("/auth-service/mfa/enroll/confirm", mapOf("code" to code), headers)
+        @Suppress("UNCHECKED_CAST")
+        val confirmed = (response?.get("data") as? Map<String, Any?>)?.get("confirmed") as? Boolean ?: false
+        return Result.success(confirmed)
+    }
+
+    suspend fun disableMfa(): Result<Unit> {
+        val headers = bearerHeaders() ?: return Result.failure(SendoraCloudAuthError.Unauthorized("Not signed in"))
+        client.post("/auth-service/mfa/disable", emptyMap(), headers)
+        return Result.success(Unit)
+    }
+
+    // --- Device sessions self-service ---
+
+    data class DeviceSession(
+        val id: String,
+        val deviceInfo: String?,
+        val lastUsedAt: String?,
+        val createdAt: String,
+    )
+
+    suspend fun listMySessions(): List<DeviceSession> {
+        val headers = bearerHeaders() ?: return emptyList()
+        val response = client.get("/auth-service/sessions/me", headers)
+        @Suppress("UNCHECKED_CAST")
+        val arr = response?.get("data") as? List<Map<String, Any?>> ?: return emptyList()
+        return arr.mapNotNull { row ->
+            val id = row["id"] as? String ?: return@mapNotNull null
+            val createdAt = row["createdAt"] as? String ?: return@mapNotNull null
+            DeviceSession(
+                id = id,
+                deviceInfo = row["deviceInfo"] as? String,
+                lastUsedAt = row["lastUsedAt"] as? String,
+                createdAt = createdAt,
+            )
+        }
+    }
+
+    suspend fun revokeSession(sessionId: String) {
+        val headers = bearerHeaders() ?: return
+        client.delete("/auth-service/sessions/me/$sessionId", headers)
+    }
+
+    suspend fun revokeAllSessions() {
+        val headers = bearerHeaders() ?: return
+        client.delete("/auth-service/sessions/me", headers)
+    }
+
+    private fun bearerHeaders(): Map<String, String>? {
+        val token = storage.authAccessToken ?: return null
+        return mapOf("Authorization" to "Bearer $token")
+    }
+
     suspend fun signOut() = mutex.withLock {
         // Wipe FIRST so the user is logged out on device even if the
         // revoke request hangs (airplane mode, 5xx, circuit open).
@@ -270,6 +419,20 @@ class SendoraCloudAuth internal constructor(
             isAnonymous = userMap["isAnonymous"] as? Boolean ?: false,
         )
         return user to tokensMap
+    }
+
+    internal val passkeys: SendoraCloudPasskeys by lazy {
+        SendoraCloudPasskeys(
+            client = client,
+            storage = storage,
+            installSession = { payload ->
+                mutex.withLock {
+                    if (!storage.isSecureAvailable) null
+                    else { persist(mapOf("data" to payload)); cachedUser }
+                }
+            },
+            wipe = { wipeLocalIdentity() },
+        )
     }
 
     private fun persist(response: Map<String, Any?>) {

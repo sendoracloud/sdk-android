@@ -47,6 +47,10 @@ object SendoraCloud {
     var auth: SendoraCloudAuth? = null
         private set
 
+    /** Passkeys (WebAuthn via Credential Manager). API 28+ at runtime. */
+    val passkeys: SendoraCloudPasskeys?
+        get() = auth?.passkeys
+
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob() + CoroutineExceptionHandler { _, e ->
         SendoraCloudLogger.error("Coroutine error", e)
     })
@@ -222,7 +226,7 @@ object SendoraCloud {
             put("properties", properties ?: emptyMap<String, Any>())
             put("context", mapOf(
                 "device" to (deviceContext?.toMap() ?: emptyMap()),
-                "sdk" to mapOf("name" to "sendora-android", "version" to "2.2.0"),
+                "sdk" to mapOf("name" to "sendora-android", "version" to "2.5.0"),
             ))
             put("sessionId", storage?.sessionId ?: "")
             put("consent", listOf("analytics"))

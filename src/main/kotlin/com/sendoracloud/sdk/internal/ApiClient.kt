@@ -60,10 +60,24 @@ internal class ApiClient(
             .getOrNull()
     }
 
-    suspend fun post(path: String, body: Map<String, Any?>): Map<String, Any?>? {
+    suspend fun post(path: String, body: Map<String, Any?>, extraHeaders: Map<String, String>? = null): Map<String, Any?>? {
         if (shouldSkip()) return null
         return withTimeoutOrNull(10_000L) {
-            withContext(Dispatchers.IO) { postInternal(path, body) }
+            withContext(Dispatchers.IO) { request("POST", path, body, extraHeaders) }
+        }
+    }
+
+    suspend fun get(path: String, extraHeaders: Map<String, String>? = null): Map<String, Any?>? {
+        if (shouldSkip()) return null
+        return withTimeoutOrNull(10_000L) {
+            withContext(Dispatchers.IO) { request("GET", path, null, extraHeaders) }
+        }
+    }
+
+    suspend fun delete(path: String, extraHeaders: Map<String, String>? = null): Map<String, Any?>? {
+        if (shouldSkip()) return null
+        return withTimeoutOrNull(10_000L) {
+            withContext(Dispatchers.IO) { request("DELETE", path, null, extraHeaders) }
         }
     }
 
@@ -72,7 +86,12 @@ internal class ApiClient(
         return (response?.get("success") as? Boolean) == true
     }
 
-    private fun postInternal(path: String, body: Map<String, Any?>): Map<String, Any?>? {
+    private fun request(
+        method: String,
+        path: String,
+        body: Map<String, Any?>?,
+        extraHeaders: Map<String, String>?,
+    ): Map<String, Any?>? {
         val fullUrl = "$baseUrl/api/v1$path"
         if (!fullUrl.startsWith("https://") &&
             !fullUrl.startsWith("http://localhost") &&
@@ -87,14 +106,17 @@ internal class ApiClient(
             if (conn is HttpsURLConnection && pinnedSslContext != null) {
                 conn.sslSocketFactory = pinnedSslContext.socketFactory
             }
-            conn.requestMethod = "POST"
+            conn.requestMethod = method
             conn.setRequestProperty("Content-Type", "application/json")
             conn.setRequestProperty("X-API-Key", apiKey)
+            extraHeaders?.forEach { (k, v) -> conn.setRequestProperty(k, v) }
             conn.connectTimeout = 5_000
             conn.readTimeout = 5_000
-            conn.doOutput = true
-            val jsonBody = JSONObject(body).toString()
-            OutputStreamWriter(conn.outputStream).use { it.write(jsonBody) }
+            if (body != null) {
+                conn.doOutput = true
+                val jsonBody = JSONObject(body).toString()
+                OutputStreamWriter(conn.outputStream).use { it.write(jsonBody) }
+            }
             val code = conn.responseCode
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
             val response = BufferedReader(InputStreamReader(stream)).use { it.readText() }
