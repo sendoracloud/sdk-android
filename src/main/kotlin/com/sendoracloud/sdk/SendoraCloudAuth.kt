@@ -229,6 +229,82 @@ class SendoraCloudAuth internal constructor(
         return parseError(response)?.let { Result.failure(it) } ?: Result.success(Unit)
     }
 
+    // --- Social sign-in (8 providers) ---
+
+    /**
+     * Verify an IdP-issued credential and mint a Sendora session.
+     * Customer's app handles the IdP dance — typically via
+     * androidx.credentials Credential Manager (Google) or the
+     * provider's SDK (Facebook, etc) or a Custom Tabs flow — then
+     * hands the result here.
+     *
+     * Provider is one of: google, github, apple, microsoft,
+     * linkedin, facebook, twitter, discord. Twitter is rejected
+     * server-side per OAuth 2.0 verified-email gap.
+     *
+     * Pass either `code` + `redirectUri` (authorization-code flow)
+     * OR `idToken` (Apple-native style; rare on Android).
+     */
+    suspend fun loginSocial(
+        provider: String,
+        code: String? = null,
+        idToken: String? = null,
+        redirectUri: String? = null,
+        codeVerifier: String? = null,
+        appleFirstName: String? = null,
+        appleLastName: String? = null,
+    ): Result<SendoraCloudAuthUser> = mutex.withLock {
+        if (!storage.isSecureAvailable) {
+            return@withLock Result.failure(SendoraCloudAuthError.SecureStorageUnavailable("EncryptedSharedPreferences unavailable"))
+        }
+        if (cachedUser != null) wipeLocalIdentity()
+
+        val body = buildMap<String, Any> {
+            put("provider", provider)
+            code?.let { put("code", it) }
+            idToken?.let { put("idToken", it) }
+            redirectUri?.let { put("redirectUri", it) }
+            codeVerifier?.let { put("codeVerifier", it) }
+            if (appleFirstName != null || appleLastName != null) {
+                put("appleName", buildMap<String, String> {
+                    appleFirstName?.let { put("firstName", it) }
+                    appleLastName?.let { put("lastName", it) }
+                })
+            }
+        }
+        callAuth("/auth-service/login/social", body)
+    }
+
+    suspend fun signInWithGoogle(code: String, redirectUri: String) =
+        loginSocial(provider = "google", code = code, redirectUri = redirectUri)
+
+    suspend fun signInWithGitHub(code: String, redirectUri: String) =
+        loginSocial(provider = "github", code = code, redirectUri = redirectUri)
+
+    /** Apple Sign In. Pass `idToken` from the native flow + name fields on first sign-in. */
+    suspend fun signInWithApple(
+        idToken: String,
+        firstName: String? = null,
+        lastName: String? = null,
+    ) = loginSocial(
+        provider = "apple",
+        idToken = idToken,
+        appleFirstName = firstName,
+        appleLastName = lastName,
+    )
+
+    suspend fun signInWithMicrosoft(code: String, redirectUri: String) =
+        loginSocial(provider = "microsoft", code = code, redirectUri = redirectUri)
+
+    suspend fun signInWithLinkedIn(code: String, redirectUri: String) =
+        loginSocial(provider = "linkedin", code = code, redirectUri = redirectUri)
+
+    suspend fun signInWithFacebook(code: String, redirectUri: String) =
+        loginSocial(provider = "facebook", code = code, redirectUri = redirectUri)
+
+    suspend fun signInWithDiscord(code: String, redirectUri: String) =
+        loginSocial(provider = "discord", code = code, redirectUri = redirectUri)
+
     suspend fun verifyMagicLink(token: String): Result<SendoraCloudAuthUser> = mutex.withLock {
         if (!storage.isSecureAvailable) {
             return@withLock Result.failure(SendoraCloudAuthError.SecureStorageUnavailable("EncryptedSharedPreferences unavailable"))
