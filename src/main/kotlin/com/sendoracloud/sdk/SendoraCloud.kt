@@ -59,13 +59,19 @@ object SendoraCloud {
         timeZone = TimeZone.getTimeZone("UTC")
     }
 
-    /** Initialize. Call once from Application.onCreate. */
-    fun init(context: Context, apiKey: String, projectId: String, options: SendoraCloudConfig? = null) {
+    /**
+     * Initialize. Call once from Application.onCreate.
+     *
+     * 3.0.0: `projectId` is now optional. When omitted the backend
+     * derives project + org + environment from the API key row.
+     * Existing callers passing a value continue to work unchanged.
+     */
+    fun init(context: Context, apiKey: String, projectId: String? = null, options: SendoraCloudConfig? = null) {
         val appContext = context.applicationContext
         val cfg = options ?: SendoraCloudConfig(apiKey = apiKey, projectId = projectId)
         val finalConfig = cfg.copy(
             apiKey = cfg.apiKey.ifEmpty { apiKey },
-            projectId = cfg.projectId.ifEmpty { projectId },
+            projectId = cfg.projectId ?: projectId,
         )
 
         try {
@@ -226,7 +232,7 @@ object SendoraCloud {
             put("properties", properties ?: emptyMap<String, Any>())
             put("context", mapOf(
                 "device" to (deviceContext?.toMap() ?: emptyMap()),
-                "sdk" to mapOf("name" to "sendora-android", "version" to "2.6.0"),
+                "sdk" to mapOf("name" to "sendora-android", "version" to "3.0.0"),
             ))
             put("sessionId", storage?.sessionId ?: "")
             put("consent", listOf("analytics"))

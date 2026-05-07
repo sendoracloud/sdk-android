@@ -3,7 +3,14 @@ package com.sendoracloud.sdk
 /** Configuration for the SendoraCloud SDK. */
 data class SendoraCloudConfig(
     val apiKey: String,
-    val projectId: String,
+    /**
+     * Project UUID. Optional as of 3.0.0 — when null the backend
+     * derives project + org + environment from the API key row
+     * server-side (matches sdk-web 2.7.0 behaviour). Pre-3.0.0
+     * callers passing a value still work; the field is surfaced on
+     * every event payload for backwards compatibility.
+     */
+    val projectId: String? = null,
     val apiBaseUrl: String = "https://api.sendoracloud.com",
     val flushInterval: Long = 30_000L,
     val flushAt: Int = 20,
