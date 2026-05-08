@@ -42,6 +42,15 @@ data class SendoraCloudConfig(
      * trust only).
      */
     val pinnedSPKIHashes: List<String> = emptyList(),
+    /**
+     * Auto-collect lifecycle events. Mirrors Firebase Analytics' auto-collected
+     * surface: `app.opened` (per launch), `app.foregrounded` /
+     * `app.backgrounded` (ProcessLifecycleOwner transitions), `session.start` /
+     * `session.end` (launch-bounded). Default: true. Set to false to opt
+     * out — useful when the host app already wires its own lifecycle
+     * telemetry.
+     */
+    val autoTrackLifecycle: Boolean = true,
 )
 
 /** HMAC identity-token options for `identify()`. */

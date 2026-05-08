@@ -153,9 +153,29 @@ object SendoraCloud {
                     scope.launch {
                         eventQueue?.persistToDisk()
                         trackSessionEnd()
+                        if (finalConfig.autoTrackLifecycle) {
+                            trackEvent("app.backgrounded", mapOf(
+                                "sessionId" to (storage?.sessionId ?: "")
+                            ))
+                        }
+                    }
+                }
+                override fun onStart(owner: LifecycleOwner) {
+                    if (finalConfig.autoTrackLifecycle) {
+                        trackEvent("app.foregrounded", mapOf(
+                            "sessionId" to (storage?.sessionId ?: "")
+                        ))
                     }
                 }
             })
+        }
+
+        if (finalConfig.autoTrackLifecycle) {
+            // app.opened fires once per `init()` (per-launch). Mirrors
+            // Firebase's `app_open` auto-event.
+            trackEvent("app.opened", mapOf(
+                "sessionId" to (storage?.sessionId ?: "")
+            ))
         }
     }
 
@@ -232,7 +252,7 @@ object SendoraCloud {
             put("properties", properties ?: emptyMap<String, Any>())
             put("context", mapOf(
                 "device" to (deviceContext?.toMap() ?: emptyMap()),
-                "sdk" to mapOf("name" to "sendora-android", "version" to "3.0.0"),
+                "sdk" to mapOf("name" to "sendora-android", "version" to "3.1.0"),
             ))
             put("sessionId", storage?.sessionId ?: "")
             put("consent", listOf("analytics"))
