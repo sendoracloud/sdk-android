@@ -47,6 +47,10 @@ object SendoraCloud {
     var auth: SendoraCloudAuth? = null
         private set
 
+    /** Live updates / persistent notifications via FCM data-only (API 26+). Initialised in `init()`. */
+    var liveActivities: SendoraCloudLiveActivities? = null
+        private set
+
     /** Passkeys (WebAuthn via Credential Manager). API 28+ at runtime. */
     val passkeys: SendoraCloudPasskeys?
         get() = auth?.passkeys
@@ -131,6 +135,11 @@ object SendoraCloud {
                 store.sessionId = UUID.randomUUID().toString()
                 eventQueue?.dropAll()
             },
+        )
+
+        liveActivities = SendoraCloudLiveActivities(
+            client = client,
+            configProvider = { config },
         )
 
         isConfigured = true
@@ -252,7 +261,7 @@ object SendoraCloud {
             put("properties", properties ?: emptyMap<String, Any>())
             put("context", mapOf(
                 "device" to (deviceContext?.toMap() ?: emptyMap()),
-                "sdk" to mapOf("name" to "sendora-android", "version" to "3.1.0"),
+                "sdk" to mapOf("name" to "sendora-android", "version" to "3.2.0"),
             ))
             put("sessionId", storage?.sessionId ?: "")
             put("consent", listOf("analytics"))
