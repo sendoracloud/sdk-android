@@ -33,6 +33,10 @@ dependencies {
     // SDK keeps minSdk = 26 by gating Build.VERSION.SDK_INT in SendoraCloudPasskeys).
     implementation("androidx.credentials:credentials:1.3.0")
     implementation("androidx.credentials:credentials-play-services-auth:1.3.0")
+    // Geofencing (s58.22) — Google Play Services Location for region monitoring.
+    // Host app must also include this; declared `compileOnly` so SDK doesn't
+    // force-pull a Google Play dependency on customers that don't need geofences.
+    compileOnly("com.google.android.gms:play-services-location:21.3.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
 }

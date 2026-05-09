@@ -51,6 +51,10 @@ object SendoraCloud {
     var liveActivities: SendoraCloudLiveActivities? = null
         private set
 
+    /** Server-managed geofences via GeofencingClient. Initialised in `init()`. */
+    var geofences: SendoraCloudGeofences? = null
+        private set
+
     /** Passkeys (WebAuthn via Credential Manager). API 28+ at runtime. */
     val passkeys: SendoraCloudPasskeys?
         get() = auth?.passkeys
@@ -140,6 +144,13 @@ object SendoraCloud {
         liveActivities = SendoraCloudLiveActivities(
             client = client,
             configProvider = { config },
+        )
+
+        geofences = SendoraCloudGeofences(
+            client = client,
+            configProvider = { config },
+            userIdProvider = { currentUserId },
+            anonIdProvider = { storage?.deviceId },
         )
 
         isConfigured = true
@@ -261,7 +272,7 @@ object SendoraCloud {
             put("properties", properties ?: emptyMap<String, Any>())
             put("context", mapOf(
                 "device" to (deviceContext?.toMap() ?: emptyMap()),
-                "sdk" to mapOf("name" to "sendora-android", "version" to "3.2.0"),
+                "sdk" to mapOf("name" to "sendora-android", "version" to "3.3.0"),
             ))
             put("sessionId", storage?.sessionId ?: "")
             put("consent", listOf("analytics"))
