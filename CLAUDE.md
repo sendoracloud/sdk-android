@@ -26,6 +26,98 @@ SendoraCloud.passkeys?.register(activity) / authenticate(activity, email)   // A
 - Event queue persisted with PII stripped.
 - `network_security_config.xml` disables cleartext.
 
+## Geofences (s58.22)
+
+Server-managed geofences via `GeofencingClient` (Google Play Services). Operator defines circular regions in the dashboard; SDK auto-fetches + registers up to **100** regions.
+
+**Permission requirements:**
+- `ACCESS_FINE_LOCATION` (runtime).
+- `ACCESS_BACKGROUND_LOCATION` on API 29+ (background transitions).
+- Host app must include `com.google.android.gms:play-services-location:21.3.0` (SDK declares `compileOnly` to avoid forcing the dep on customers without geofences).
+
+**Host-app pattern:**
+```kotlin
+// Application.onCreate or after permission grant
+SendoraCloud.geofences?.start(applicationContext)
+
+// On app foreground
+SendoraCloud.geofences?.refresh(applicationContext)
+```
+
+**BroadcastReceiver wiring** — the SDK uses an Intent action `com.sendoracloud.GEOFENCE_TRANSITION`. Add a receiver:
+```kotlin
+class MyGeofenceReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        SendoraCloud.geofences?.handleBroadcast(intent)
+    }
+}
+```
++ in AndroidManifest.xml:
+```xml
+<receiver android:name=".MyGeofenceReceiver" android:exported="false">
+    <intent-filter>
+        <action android:name="com.sendoracloud.GEOFENCE_TRANSITION" />
+    </intent-filter>
+</receiver>
+```
+
+Enter / exit / dwell transitions emit `geofence.entered` / `.exited` / `.dwelled` events; wire workflows server-side to fire push.
+
+**Notes:**
+- Aggressive OEMs (Xiaomi, Huawei) may delay transitions until the user opens the app — Battery Optimization quirk.
+- 100-region cap is per-app, shared with any other `GeofencingClient` registrations the host app makes.
+
+## Live Updates (s58.21)
+
+Cross-platform Live Activities. Android equivalent of iOS ActivityKit, implemented via FCM data-only push routed to host-app's `FirebaseMessagingService` which updates a `NotificationCompat` ongoing notification.
+
+**Why FCM data-only:** Android has no APNs `push-type=liveactivity` equivalent. Persistent live UIs use a regular ongoing notification updated via `NotificationManager.notify()`. Data-only push wakes the app even in Doze (priority HIGH).
+
+**Recommended surface:** `NotificationCompat.ProgressStyle` (API 34+) for delivery / install / countdown UIs; `BigTextStyle` fallback for older Android.
+
+**Host-app pattern:**
+
+```kotlin
+// At app start
+SendoraCloud.liveActivities?.ensureChannel(applicationContext)
+
+// When opening a live notification
+SendoraCloud.liveActivities?.start(
+    fcmToken = currentFcmToken,
+    activityType = "OrderTracker",
+    attributes = mapOf("orderId" to "1234"),
+    contentState = mapOf("status" to "preparing", "minutesAway" to 30),
+    externalId = "order-1234",
+    userId = "user-42",
+) { activityId -> /* persist activityId for later end() */ }
+
+// In FirebaseMessagingService.onMessageReceived
+class MyFcm : FirebaseMessagingService() {
+    override fun onMessageReceived(message: RemoteMessage) {
+        SendoraCloud.liveActivities?.handleFcmMessage(
+            applicationContext,
+            message.data,
+            buildNotification = { contentState ->
+                NotificationCompat.Builder(this, "sendora_live_updates")
+                    .setSmallIcon(R.drawable.ic_status)
+                    .setContentTitle("Order #${contentState.optString("orderId")}")
+                    .setContentText("Status: ${contentState.optString("status")}")
+                    .setOngoing(true)
+                    .setOnlyAlertOnce(true)
+                    .build()
+            },
+        )
+    }
+}
+```
+
+**Server-side update + end** — same endpoints as iOS (`/push/live-activities/:id/update`, `DELETE /:id`). Backend routes to FCM when `platform=android`.
+
+**Notable Android quirks:**
+- POST_NOTIFICATIONS runtime permission required (API 33+). Host app handles.
+- Battery Optimization may delay updates on aggressive OEMs (Xiaomi, Huawei). Android lacks Apple-style update budgets.
+- ProgressStyle requires API 34+; older Android uses BigTextStyle.
+
 ## Publish
 
 Tag a new version; JitPack builds on first consumer request. Gradle wrapper must be committed.

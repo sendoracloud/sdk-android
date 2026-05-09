@@ -55,6 +55,10 @@ object SendoraCloud {
     var geofences: SendoraCloudGeofences? = null
         private set
 
+    /** Generic push-token registration + open tracking. Initialised in `init()`. */
+    var push: SendoraCloudPush? = null
+        private set
+
     /** Passkeys (WebAuthn via Credential Manager). API 28+ at runtime. */
     val passkeys: SendoraCloudPasskeys?
         get() = auth?.passkeys
@@ -151,6 +155,12 @@ object SendoraCloud {
             configProvider = { config },
             userIdProvider = { currentUserId },
             anonIdProvider = { storage?.deviceId },
+        )
+
+        push = SendoraCloudPush(
+            client = client,
+            scope = scope,
+            userIdProvider = { currentUserId },
         )
 
         isConfigured = true
