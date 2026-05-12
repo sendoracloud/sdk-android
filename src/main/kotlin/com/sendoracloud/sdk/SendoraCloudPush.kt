@@ -27,6 +27,13 @@ import java.util.TimeZone
  *
  * Identify the user FIRST so the token binds to a userId — anonymous
  * tokens can't be targeted via `{ userIds: [...] }`.
+ *
+ * Coroutine-scoped cleanup: registration runs on the SDK's process-wide
+ * SupervisorJob CoroutineScope (created in SendoraCloud.init). Process-
+ * killed mid-flight = single-attempt loss; FCM tokens are durable +
+ * deterministic, so onNewToken on next launch re-fires registerToken with
+ * the same token — backend upsert by (orgId, token) is idempotent. No
+ * leak: scope is bound to process lifetime, GC-clean on kill.
  */
 class SendoraCloudPush internal constructor(
     private val client: ApiClient,

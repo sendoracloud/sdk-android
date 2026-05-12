@@ -465,6 +465,18 @@ class SendoraCloudAuth internal constructor(
         return Result.success(parsed.first)
     }
 
+    /**
+     * Hot-path token refresh. Mutexed so a coroutine fan-out doesn't
+     * produce duplicate /refresh round-trips.
+     *
+     * s58.46 — on a dead-token signal (INVALID_REFRESH_TOKEN /
+     * UNAUTHORIZED / HTTP_401 / RATE_LIMIT) we WIPE the stored
+     * refresh token. Pre-s58.46 we returned null but kept the dead
+     * token in storage, so the next caller re-tried the same token
+     * forever (Pulse News iOS hit /refresh ~1×/s for hours). The
+     * wipe forces the next op to fall through to anonymous mint or
+     * surface signed-out state to the host app instead of looping.
+     */
     private suspend fun refreshAccessToken(): String? = refreshMutex.withLock {
         val nowMs = System.currentTimeMillis()
         // Re-check after acquiring the lock; another caller may have
@@ -475,6 +487,15 @@ class SendoraCloudAuth internal constructor(
 
         val refresh = storage.authRefreshToken ?: return@withLock null
         val response = client.post("/auth-service/token/refresh", mapOf("refreshToken" to refresh))
+        if (response != null && response["success"] == false) {
+            @Suppress("UNCHECKED_CAST")
+            val error = response["error"] as? Map<String, Any?>
+            val code = error?.get("code") as? String
+            if (code != null && isDeadRefreshError(code)) {
+                wipeLocalIdentity()
+            }
+            return@withLock null
+        }
         @Suppress("UNCHECKED_CAST")
         val data = response?.get("data") as? Map<String, Any?> ?: return@withLock null
         val accessToken = data["accessToken"] as? String
@@ -489,6 +510,14 @@ class SendoraCloudAuth internal constructor(
         storage.authAccessExpiresAt = newExp
         cachedExpiresAt = newExp
         accessToken
+    }
+
+    private fun isDeadRefreshError(code: String): Boolean {
+        return code == "INVALID_REFRESH_TOKEN" ||
+                code == "UNAUTHORIZED" ||
+                code == "HTTP_401" ||
+                code == "RATE_LIMIT_EXCEEDED" ||
+                code == "RATE_LIMIT"
     }
 
     private fun parseError(response: Map<String, Any?>?): SendoraCloudAuthError? {
