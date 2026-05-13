@@ -53,6 +53,56 @@ override fun onNewIntent(intent: Intent) {
 }
 ```
 
+## Deep links (SDK-side mint + warm + deferred)
+
+Three additional moves under `SendoraCloud.links` (3.7.0+):
+
+```kotlin
+// 1. Mint a share link from inside the app. Public-key gated; backend
+//    validates against the iOS bundle id / Android package name you
+//    registered in Dashboard → Apps.
+val input = SendoraCloudLinks.LinkCreateInput(
+    title = article.title,
+    fallbackUrl = "https://yourapp.com/articles/${article.id}",
+    iosDeepLinkPath = "/articles/${article.id}",
+    androidDeepLinkPath = "/articles/${article.id}",
+    linkData = mapOf("articleId" to article.id),
+)
+SendoraCloud.links?.create(input) { result ->
+    result.getOrNull()?.let { link ->
+        // share link.url via Intent.ACTION_SEND
+    }
+}
+
+// 2. Register the open-callback. Fires for warm (Android App Link)
+//    AND deferred (cold-launch after install) opens.
+SendoraCloud.links?.onLinkOpened { event ->
+    (event.linkData["articleId"] as? String)?.let { navigateToArticle(it) }
+}
+
+// 3. Warm path — wire from Activity.onCreate / onNewIntent:
+intent.data?.let { SendoraCloud.links?.handleAppLink(it) }
+
+// 4. Cold path — call once on first foregrounded launch. Play Install
+//    Referrer is the preferred input (100% accurate when present);
+//    fingerprintHash is the fallback.
+val client = InstallReferrerClient.newBuilder(this).build()
+client.startConnection(object : InstallReferrerStateListener {
+    override fun onInstallReferrerSetupFinished(code: Int) {
+        if (code == InstallReferrerClient.InstallReferrerResponse.OK) {
+            val referrer = client.installReferrer.installReferrer
+            SendoraCloud.links?.matchDeferred(
+                SendoraCloudLinks.DeferredMatchInput(installReferrer = referrer)
+            ) { /* event or null */ }
+            client.endConnection()
+        }
+    }
+    override fun onInstallReferrerServiceDisconnected() {}
+})
+```
+
+Bundle gate: SDK auto-supplies `appContext.packageName` on `links.create()` — backend rejects if it doesn't match a registered Android app for the project.
+
 ## Security model
 
 - **Secret-key refusal.** `init()` logs + aborts if given a key starting with `sk_`.
