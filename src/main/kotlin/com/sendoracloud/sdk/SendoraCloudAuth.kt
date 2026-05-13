@@ -101,12 +101,23 @@ class SendoraCloudAuth internal constructor(
     /**
      * Returns a non-expired access token. Triggers a single-flight
      * refresh if the cached token is past expiry.
+     *
+     * s58.47 — when the cached ACCESS token is missing but a refresh
+     * token is still in EncryptedSharedPreferences (cold start after
+     * the access token's 15-min TTL elapsed, partial persist, or
+     * AndroidKeyStore eviction), drive a refresh instead of
+     * returning null. Pre-s58.47 we bailed immediately, which left
+     * the host app reading null and triggering a fresh anonymous
+     * mint on every cold launch.
      */
     suspend fun getAccessToken(): String? {
-        val token = storage.authAccessToken ?: return null
+        val token = storage.authAccessToken
         val exp = cachedExpiresAt
         val nowMs = System.currentTimeMillis()
-        if (exp > 0 && nowMs < exp - refreshSafetyMs) return token
+        if (token != null && exp > 0 && nowMs < exp - refreshSafetyMs) return token
+        // Either no access token at all, or it's past (expiry - safety).
+        // refreshAccessToken handles both: it short-circuits when no
+        // refresh token is in storage either, returning null.
         return refreshAccessToken()
     }
 
