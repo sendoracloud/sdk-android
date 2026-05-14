@@ -81,6 +81,91 @@ internal class ApiClient(
         }
     }
 
+    /**
+     * Rich response. Surfaces HTTP status + the typed `error.code` /
+     * `error.message` envelope fields so callers (Links) can map backend
+     * errors into typed exceptions instead of swallowing them as `null`.
+     * Independent of the circuit breaker for HTTP 4xx — those are logical
+     * errors from the caller's perspective, not transport failures.
+     */
+    data class RichResponse(
+        val statusCode: Int,
+        val body: Map<String, Any?>?,
+        val errorCode: String?,
+        val errorMessage: String?,
+    )
+
+    suspend fun requestWithDetails(
+        method: String,
+        path: String,
+        body: Map<String, Any?>?,
+    ): RichResponse {
+        if (shouldSkip()) {
+            return RichResponse(0, null, "NETWORK", "Circuit breaker open — too many recent failures")
+        }
+        return withTimeoutOrNull(10_000L) {
+            withContext(Dispatchers.IO) { doRichRequest(method, path, body) }
+        } ?: RichResponse(0, null, "NETWORK", "Request timed out")
+    }
+
+    private fun doRichRequest(
+        method: String,
+        path: String,
+        body: Map<String, Any?>?,
+    ): RichResponse {
+        val fullUrl = "$baseUrl/api/v1$path"
+        if (!fullUrl.startsWith("https://") &&
+            !fullUrl.startsWith("http://localhost") &&
+            !fullUrl.startsWith("http://10.0.2.2") &&
+            !fullUrl.startsWith("http://127.0.0.1")) {
+            SendoraCloudLogger.error("ApiClient refusing non-HTTPS URL")
+            return RichResponse(0, null, "NETWORK", "Non-HTTPS URL refused")
+        }
+        return try {
+            val conn = URL(fullUrl).openConnection() as HttpURLConnection
+            if (conn is HttpsURLConnection && pinnedSslContext != null) {
+                conn.sslSocketFactory = pinnedSslContext.socketFactory
+            }
+            conn.requestMethod = method
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.setRequestProperty("X-API-Key", apiKey)
+            conn.connectTimeout = 5_000
+            conn.readTimeout = 5_000
+            if (body != null) {
+                conn.doOutput = true
+                val jsonBody = JSONObject(body).toString()
+                OutputStreamWriter(conn.outputStream).use { it.write(jsonBody) }
+            }
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            val raw = BufferedReader(InputStreamReader(stream)).use { it.readText() }
+            val parsed: Map<String, Any?>? = runCatching {
+                val json = JSONObject(raw)
+                json.keys().asSequence().associateWith { key -> json.get(key) }
+            }.getOrNull()
+            if (code in 200..299) {
+                recordSuccess()
+                RichResponse(code, parsed, null, null)
+            } else {
+                // 4xx isn't a transport failure — don't flip the breaker.
+                @Suppress("UNCHECKED_CAST")
+                val err = (parsed?.get("error") as? JSONObject)?.let { eo ->
+                    mapOf("code" to (eo.opt("code") as? String), "message" to (eo.opt("message") as? String))
+                } ?: parsed?.get("error")?.let { e ->
+                    // already a Map (e.g. when JSON parsed differently)
+                    (e as? Map<String, Any?>)
+                }
+                val errCode = err?.get("code") as? String
+                val errMsg = err?.get("message") as? String
+                RichResponse(code, parsed, errCode, errMsg)
+            }
+        } catch (e: Exception) {
+            SendoraCloudLogger.debug("API error ($path): ${e.javaClass.simpleName}")
+            recordFailure()
+            RichResponse(0, null, "NETWORK", "Network error: ${e.javaClass.simpleName}")
+        }
+    }
+
     suspend fun postBatch(path: String, events: List<Map<String, Any?>>): Boolean {
         val response = post(path, mapOf("events" to events))
         return (response?.get("success") as? Boolean) == true

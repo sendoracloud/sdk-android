@@ -170,6 +170,7 @@ object SendoraCloud {
         links = SendoraCloudLinks(
             client = client,
             packageName = appContext.packageName,
+            linkHosts = finalConfig.linkHosts,
             scope = scope,
         )
 
@@ -292,7 +293,7 @@ object SendoraCloud {
             put("properties", properties ?: emptyMap<String, Any>())
             put("context", mapOf(
                 "device" to (deviceContext?.toMap() ?: emptyMap()),
-                "sdk" to mapOf("name" to "sendora-android", "version" to "3.7.0"),
+                "sdk" to mapOf("name" to "sendora-android", "version" to "3.8.0"),
             ))
             put("sessionId", storage?.sessionId ?: "")
             put("consent", listOf("analytics"))
