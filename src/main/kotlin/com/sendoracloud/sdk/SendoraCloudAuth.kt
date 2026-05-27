@@ -5,11 +5,16 @@ import com.sendoracloud.sdk.internal.SendoraCloudLogger
 import com.sendoracloud.sdk.internal.Storage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
+import kotlin.random.Random
 
 /**
  * Auth Service surface for the Android SDK.
@@ -65,6 +70,9 @@ class SendoraCloudAuth internal constructor(
     @Volatile private var cachedExpiresAt: Long = 0L
     private val mutex = Mutex()
     private val refreshMutex = Mutex()
+    // Long-lived coroutine scope for the proactive-refresh cron (s58.73).
+    // SupervisorJob so a single tick failure doesn't kill the loop.
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val refreshSafetyMs = 30_000L
 
     init {
@@ -602,12 +610,102 @@ class SendoraCloudAuth internal constructor(
         }.toString()
         storage.authUserJson = userJson
         onIdentityChange(user.id)
+        startProactiveRefreshCron()
     }
 
     private suspend fun wipeLocalIdentity() {
         cachedUser = null
         cachedExpiresAt = 0L
         storage.clearAuthTokens()
+        stopProactiveRefreshCron()
         onAnonymousWipe()
+    }
+
+    // ---- Proactive refresh (s58.73) -----------------------------------
+    //
+    // Background coroutine that ticks every 60s + once on app foreground.
+    // Refreshes when access-token TTL has burned ~80% (with ±30s jitter
+    // to avoid herd synchronisation across multiple app instances on the
+    // same network). Refresh becomes a scheduled event; no more 401-driven
+    // race on the next interaction.
+    //
+    // Foreground signal: ProcessLifecycleOwner.ON_START. We import lazily
+    // via reflection because androidx.lifecycle is a host-app dep on the
+    // SDK side (no hard dep, lets app authors who don't want lifecycle
+    // continue compiling). When unavailable we still get the 60s tick.
+
+    private var proactiveJob: Job? = null
+    private var lifecycleObserver: Any? = null
+
+    private fun startProactiveRefreshCron() {
+        if (proactiveJob?.isActive == true) return
+        proactiveJob = scope.launch {
+            while (isActive) {
+                tickProactive()
+                delay(60_000L)
+            }
+        }
+        registerLifecycleObserver()
+    }
+
+    private fun stopProactiveRefreshCron() {
+        proactiveJob?.cancel()
+        proactiveJob = null
+        unregisterLifecycleObserver()
+    }
+
+    private suspend fun tickProactive() {
+        val nowMs = System.currentTimeMillis()
+        val expMs = storage.authAccessExpiresAt
+        if (expMs <= 0L) return
+        val remainingMs = expMs - nowMs
+        if (remainingMs <= 0L) return
+        val guessOriginalMs = maxOf(remainingMs, 5L * 60_000L)
+        val jitter = Random.nextLong(-30_000L, 30_000L)
+        val fireWhenRemainingMs = (guessOriginalMs * 0.2).toLong() + jitter
+        if (remainingMs <= fireWhenRemainingMs) {
+            refreshAccessToken()
+        }
+    }
+
+    private fun registerLifecycleObserver() {
+        try {
+            // Reflection-loaded so the SDK doesn't hard-require
+            // androidx.lifecycle. Available on every modern Android app
+            // that uses Jetpack, but absent in minimal setups.
+            val ownerClass = Class.forName("androidx.lifecycle.ProcessLifecycleOwner")
+            val owner = ownerClass.getMethod("get").invoke(null)
+            val lifecycle = owner.javaClass.getMethod("getLifecycle").invoke(owner)
+            val observerClass = Class.forName("androidx.lifecycle.DefaultLifecycleObserver")
+            val handler = java.lang.reflect.Proxy.newProxyInstance(
+                observerClass.classLoader,
+                arrayOf(observerClass),
+            ) { _, method, _ ->
+                if (method.name == "onStart") {
+                    scope.launch { tickProactive() }
+                }
+                null
+            }
+            lifecycle.javaClass.getMethod("addObserver", Class.forName("androidx.lifecycle.LifecycleObserver"))
+                .invoke(lifecycle, handler)
+            lifecycleObserver = handler
+        } catch (_: Throwable) {
+            // androidx.lifecycle missing — fall back to the 60s tick only.
+        }
+    }
+
+    private fun unregisterLifecycleObserver() {
+        try {
+            val obs = lifecycleObserver ?: return
+            val ownerClass = Class.forName("androidx.lifecycle.ProcessLifecycleOwner")
+            val owner = ownerClass.getMethod("get").invoke(null)
+            val lifecycle = owner.javaClass.getMethod("getLifecycle").invoke(owner)
+            lifecycle.javaClass.getMethod("removeObserver", Class.forName("androidx.lifecycle.LifecycleObserver"))
+                .invoke(lifecycle, obs)
+        } catch (_: Throwable) {
+            // No-op — observer was never registered.
+        } finally {
+            lifecycleObserver = null
+        }
     }
 }
