@@ -246,9 +246,21 @@ class SendoraCloudAuth internal constructor(
         Result.success(SignInOutcome.Authenticated(parsed.first))
     }
 
+    /**
+     * Returns the stored anon refresh token iff the local subject is
+     * currently anonymous. Used by every identified-session-mint path
+     * so the backend can run device-takeover (s58.111 + s58.112).
+     * `internal` so cross-file helpers (passkey assertion) can read
+     * it without copying the gating logic.
+     */
+    internal fun takeoverHint(): String? =
+        if (cachedUser?.isAnonymous == true) storage.authRefreshToken else null
+
     /** Exchange the MFA challenge token + TOTP/recovery code for a session. */
     suspend fun challengeMfa(challengeToken: String, code: String): Result<SendoraCloudAuthUser> = mutex.withLock {
-        callAuth("/auth-service/mfa/challenge", mapOf("challengeToken" to challengeToken, "code" to code))
+        val body = mutableMapOf<String, Any>("challengeToken" to challengeToken, "code" to code)
+        takeoverHint()?.let { body["prevAnonRefreshToken"] = it }
+        callAuth("/auth-service/mfa/challenge", body)
     }
 
     // --- Magic link ---
@@ -342,8 +354,11 @@ class SendoraCloudAuth internal constructor(
         if (!storage.isSecureAvailable) {
             return@withLock Result.failure(SendoraCloudAuthError.SecureStorageUnavailable("EncryptedSharedPreferences unavailable"))
         }
+        val prev = takeoverHint()
         if (cachedUser != null) wipeLocalIdentity()
-        callAuth("/auth-service/magic-link/verify", mapOf("token" to token))
+        val body = mutableMapOf<String, Any>("token" to token)
+        prev?.let { body["prevAnonRefreshToken"] = it }
+        callAuth("/auth-service/magic-link/verify", body)
     }
 
     // --- Email OTP (6-digit cross-device code) ---
@@ -357,8 +372,11 @@ class SendoraCloudAuth internal constructor(
         if (!storage.isSecureAvailable) {
             return@withLock Result.failure(SendoraCloudAuthError.SecureStorageUnavailable("EncryptedSharedPreferences unavailable"))
         }
+        val prev = takeoverHint()
         if (cachedUser != null) wipeLocalIdentity()
-        callAuth("/auth-service/email-otp/verify", mapOf("email" to email, "code" to code))
+        val body = mutableMapOf<String, Any>("email" to email, "code" to code)
+        prev?.let { body["prevAnonRefreshToken"] = it }
+        callAuth("/auth-service/email-otp/verify", body)
     }
 
     // --- Password reset + email verification ---
@@ -600,6 +618,7 @@ class SendoraCloudAuth internal constructor(
                 }
             },
             wipe = { wipeLocalIdentity() },
+            takeoverHintProvider = { takeoverHint() },
         )
     }
 

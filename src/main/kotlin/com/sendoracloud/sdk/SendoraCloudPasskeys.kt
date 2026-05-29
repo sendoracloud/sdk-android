@@ -47,6 +47,12 @@ class SendoraCloudPasskeys internal constructor(
     private val storage: Storage,
     private val installSession: suspend (Map<String, Any?>) -> SendoraCloudAuthUser?,
     private val wipe: suspend () -> Unit,
+    /**
+     * Returns the stored anon refresh token iff the local subject is
+     * currently anonymous (device-takeover, s58.112). Injected by
+     * SendoraCloud so we don't take a hard ref on the auth object.
+     */
+    private val takeoverHintProvider: () -> String? = { null },
 ) {
     sealed class PasskeyError(message: String) : Throwable(message) {
         class PlatformUnsupported(message: String) : PasskeyError(message)
@@ -158,8 +164,12 @@ class SendoraCloudPasskeys internal constructor(
         // 4. Verify + mint session.
         val parsed = runCatching { JSONObject(responseJson) }.getOrNull()
             ?: return Result.failure(PasskeyError.CredentialManagerFailed("Non-JSON authentication response"))
+        val finishBody = mutableMapOf<String, Any>("response" to parsed.toMap())
+        // Device-takeover (s58.112): if device currently anonymous,
+        // forward the anon refresh so backend retires anon row.
+        takeoverHintProvider()?.let { finishBody["prevAnonRefreshToken"] = it }
         val finishRes = runCatching {
-            client.post("/auth-service/passkeys/authenticate/finish", mapOf("response" to parsed.toMap()))
+            client.post("/auth-service/passkeys/authenticate/finish", finishBody)
         }.getOrElse { return Result.failure(PasskeyError.Network(it.message ?: "authenticate/finish failed")) }
 
         @Suppress("UNCHECKED_CAST")
