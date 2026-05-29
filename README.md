@@ -21,9 +21,18 @@ Add the dependency in your module's `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("com.github.sendoracloud:sdk-android:3.8.0")
+    implementation("com.github.sendoracloud:sdk-android:4.0.0")
 }
 ```
+
+## Upgrading from 3.x
+
+4.0.0 aligns with the backend's unprefixed alias routes (s58.104) — the
+backend now resolves the org from the API key server-side. The Android
+SDK already used unprefixed URLs internally, so no host-app changes are
+required other than bumping the JitPack pin. The `SendoraCloud.init()`
+signature (`context`, `apiKey`, `projectId`, `options`) is unchanged —
+no `orgId` parameter exists.
 
 ## Quick start
 
