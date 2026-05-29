@@ -60,6 +60,20 @@ sealed class SendoraCloudAuthError(message: String) : Throwable(message) {
     class Unknown(message: String) : SendoraCloudAuthError(message)
 }
 
+/**
+ * Detail handed to onDeviceTakeover subscribers. Fires once per
+ * identified-signin call where the backend retired an anonymous
+ * user_id (anon → identified flip on the same device, s58.111+).
+ * Host app's only job is to delete the matching row from any
+ * local mirror table so audience queries joining on user_id stop
+ * matching the stale anon row.
+ */
+data class DeviceTakeoverEvent(
+    val retiredAnonUserId: String,
+    val identifiedUserId: String,
+    val at: Long,
+)
+
 class SendoraCloudAuth internal constructor(
     private val client: ApiClient,
     private val storage: Storage,
@@ -70,6 +84,10 @@ class SendoraCloudAuth internal constructor(
     @Volatile private var cachedExpiresAt: Long = 0L
     private val mutex = Mutex()
     private val refreshMutex = Mutex()
+    // s58.116 — inline device-takeover listeners. UUID-keyed so
+    // callers can unsubscribe via the returned lambda.
+    private val takeoverListeners = java.util.concurrent.ConcurrentHashMap<java.util.UUID, (DeviceTakeoverEvent) -> Unit>()
+    @Volatile private var lastTakeover: DeviceTakeoverEvent? = null
     // Long-lived coroutine scope for the proactive-refresh cron (s58.73).
     // SupervisorJob so a single tick failure doesn't kill the loop.
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -255,6 +273,60 @@ class SendoraCloudAuth internal constructor(
      */
     internal fun takeoverHint(): String? =
         if (cachedUser?.isAnonymous == true) storage.authRefreshToken else null
+
+    // --- Device-takeover listener (s58.116 parity with RN 1.0.5) ---
+
+    /**
+     * Register a callback fired when the backend retires an anon
+     * `user_id` during a signin on this device. Use it to delete
+     * the matching row from any local mirror table — Sendora's own
+     * `auth_service_users` + `push_tokens` are already cleaned up
+     * server-side. Returns an unsubscribe lambda.
+     *
+     * Listeners fire on every identified-signin path: signIn /
+     * loginSocial / verifyMagicLink / verifyEmailOtp /
+     * challengeMfa / passkey authenticate. Local-only — survives
+     * webhook receiver downtime. For server-pipeline cleanup also
+     * subscribe to the `auth.device_takeover` webhook.
+     */
+    fun onDeviceTakeover(listener: (DeviceTakeoverEvent) -> Unit): () -> Unit {
+        val key = java.util.UUID.randomUUID()
+        takeoverListeners[key] = listener
+        return { takeoverListeners.remove(key) }
+    }
+
+    /**
+     * Returns the most recent takeover the SDK observed in this
+     * session, or null if none. Lets late subscribers pick up the
+     * takeover their handler missed.
+     */
+    fun getLastDeviceTakeover(): DeviceTakeoverEvent? = lastTakeover
+
+    /**
+     * Internal — called from every identified-signin path with the
+     * `retiredAnonUserId` parsed off the backend response. Snapshot
+     * + dispatch outside any mutex so a listener can't deadlock by
+     * re-entering the auth surface.
+     *
+     * Validates UUID shape before firing. The value comes from a
+     * response body that a MitM could tamper; a non-UUID value
+     * handed to a listener that interpolates it into a path (the
+     * documented pattern) becomes a path-injection sink in the host
+     * app.
+     */
+    internal fun fireDeviceTakeover(retiredAnonUserId: String, identifiedUserId: String) {
+        if (retiredAnonUserId.isEmpty()) return
+        if (!isCanonicalUuid(retiredAnonUserId)) return
+        val evt = DeviceTakeoverEvent(
+            retiredAnonUserId = retiredAnonUserId,
+            identifiedUserId = identifiedUserId,
+            at = System.currentTimeMillis(),
+        )
+        lastTakeover = evt
+        for (fn in takeoverListeners.values.toList()) {
+            runCatching { fn(evt) }
+        }
+    }
 
     /** Exchange the MFA challenge token + TOTP/recovery code for a session. */
     suspend fun challengeMfa(challengeToken: String, code: String): Result<SendoraCloudAuthUser> = mutex.withLock {
@@ -563,6 +635,19 @@ class SendoraCloudAuth internal constructor(
         accessToken
     }
 
+    /**
+     * Canonical UUID validator. Defends against tampered
+     * `retiredAnonUserId` response values reaching host-app
+     * listeners as a path-injection sink.
+     */
+    private fun isCanonicalUuid(s: String): Boolean {
+        return try {
+            java.util.UUID.fromString(s).toString().equals(s, ignoreCase = true)
+        } catch (_: IllegalArgumentException) {
+            false
+        }
+    }
+
     private fun isDeadRefreshError(code: String): Boolean {
         return code == "INVALID_REFRESH_TOKEN" ||
                 code == "UNAUTHORIZED" ||
@@ -644,6 +729,17 @@ class SendoraCloudAuth internal constructor(
         storage.authUserJson = userJson
         onIdentityChange(user.id)
         startProactiveRefreshCron()
+
+        // s58.116 — fire inline device-takeover listener when the
+        // backend retired an anon row during this signin. Read from
+        // the outer `data` envelope; passkey path passes `data` only
+        // (mapOf("data" to payload)) so this still finds it.
+        @Suppress("UNCHECKED_CAST")
+        val data = response["data"] as? Map<String, Any?>
+        val retiredAnonUserId = data?.get("retiredAnonUserId") as? String
+        if (!retiredAnonUserId.isNullOrEmpty()) {
+            fireDeviceTakeover(retiredAnonUserId, user.id)
+        }
     }
 
     private suspend fun wipeLocalIdentity() {
