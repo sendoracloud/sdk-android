@@ -184,11 +184,21 @@ class SendoraCloudAuth internal constructor(
                 "EncryptedSharedPreferences unavailable — refusing to persist auth tokens"
             ))
         }
+        // Device-takeover (backend s58.111): if this device holds an
+        // anonymous session, forward its refresh token to /login so
+        // the backend revokes the anon session, reassigns this
+        // device's push tokens to the identified user, and deletes
+        // the anon user row. One device → one user_id on the platform
+        // side. Read BEFORE wipe.
+        val prevAnonRefreshToken: String? = if (cachedUser?.isAnonymous == true) storage.authRefreshToken else null
+
         // Wipe BEFORE the network call so any track() during the auth
         // round-trip can't attach to the prior identity (TOCTOU).
         if (cachedUser != null) wipeLocalIdentity()
 
-        val response = client.post("/auth-service/login", mapOf("email" to email, "password" to password))
+        val body = mutableMapOf<String, Any?>("email" to email, "password" to password)
+        if (prevAnonRefreshToken != null) body["prevAnonRefreshToken"] = prevAnonRefreshToken
+        val response = client.post("/auth-service/login", body)
         val err = parseError(response)
         if (err != null) return@withLock Result.failure(err)
         val parsed = parseSuccess(response)

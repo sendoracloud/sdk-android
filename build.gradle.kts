@@ -48,7 +48,7 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.sendoracloud"
                 artifactId = "sdk-android"
-                version = "4.0.0"
+                version = "4.0.1"
                 pom {
                     name.set("Sendora Cloud Android SDK")
                     description.set("Deep linking, attribution, and event tracking for Android.")
