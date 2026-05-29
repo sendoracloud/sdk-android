@@ -286,6 +286,9 @@ class SendoraCloudAuth internal constructor(
         if (!storage.isSecureAvailable) {
             return@withLock Result.failure(SendoraCloudAuthError.SecureStorageUnavailable("EncryptedSharedPreferences unavailable"))
         }
+        // Device-takeover hint — same posture as signIn().
+        val prevAnonRefreshToken: String? = if (cachedUser?.isAnonymous == true) storage.authRefreshToken else null
+
         if (cachedUser != null) wipeLocalIdentity()
 
         val body = buildMap<String, Any> {
@@ -300,6 +303,7 @@ class SendoraCloudAuth internal constructor(
                     appleLastName?.let { put("lastName", it) }
                 })
             }
+            prevAnonRefreshToken?.let { put("prevAnonRefreshToken", it) }
         }
         callAuth("/auth-service/login/social", body)
     }
