@@ -51,6 +51,15 @@ data class SendoraCloudConfig(
      * telemetry.
      */
     val autoTrackLifecycle: Boolean = true,
+    /**
+     * Auto-measure foreground engagement time per screen. When true (default),
+     * `trackScreen(name)` emits an `app.engagement` event carrying
+     * foreground-only `durationMs` for the previously-viewed screen. Time
+     * while the app is backgrounded is never counted (GA4 engagement_time_msec
+     * model). Only measures screens you name via `trackScreen(name)` — there
+     * is no Activity/Fragment auto-instrumentation, so screen names stay clean.
+     */
+    val autoTrackEngagement: Boolean = true,
 )
 
 /** HMAC identity-token options for `identify()`. */

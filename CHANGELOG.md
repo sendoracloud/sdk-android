@@ -1,5 +1,21 @@
 # Changelog
 
+## 4.1.0
+
+**Wave 51 — Play Install Referrer.**
+
+`reportInstallIfNeeded` now consults Google Play's `InstallReferrerClient` on first launch and routes the install through the new `/attribution/install-referrer` endpoint when a referrer is available. Server-side deterministic match on `sendora_link_id` / `gclid` / `fbclid` / `ttclid` / `utm_source+utm_campaign` runs **before** fingerprint/IP fallback, surviving Play Store handoff.
+
+**Host app must add the dep** for install-referrer support:
+
+```kotlin
+dependencies {
+    implementation("com.android.installreferrer:installreferrer:2.2")
+}
+```
+
+SDK declares the dep `compileOnly`, so apps without it skip the referrer path and fall back to `/attribution/install` (unchanged behaviour).
+
 ## 4.0.5
 
 **Device-takeover inline listener** (parity with RN 1.0.5).

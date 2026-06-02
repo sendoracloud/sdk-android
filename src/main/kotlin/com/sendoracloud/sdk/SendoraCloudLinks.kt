@@ -155,6 +155,15 @@ class SendoraCloudLinks internal constructor(
     private val prewarmTtlMs = 5 * 60 * 1000L
     private val prewarmMax = 50
 
+    /**
+     * Wave 28 — concurrent-mint cap. A runaway loop calling `prewarm()`
+     * (eg in a Compose LazyColumn item composable) would otherwise burn
+     * through the backend's per-key rate limit + customer's plan quota.
+     * 5 inflight matches real share-row UIs.
+     */
+    private var prewarmInflight = 0
+    private val prewarmMaxInflight = 5
+
     private fun cacheKey(input: LinkCreateInput, override: String?): String {
         if (override != null) return "k:$override"
         val body = buildCreateBody(input)
@@ -203,18 +212,31 @@ class SendoraCloudLinks internal constructor(
         (input.androidPackageName ?: packageName)?.let { put("androidPackageName", it) }
     }
 
-    /** Background-mint + cache. Fire-and-forget. */
+    /**
+     * Background-mint + cache. Fire-and-forget.
+     *
+     * Wave 28 — silently drops the call when more than
+     * [prewarmMaxInflight] mints are already in flight. Prewarm is
+     * fire-and-forget by contract; an overflow `prewarm()` is fine to
+     * skip because the next matching `create()` will do the mint
+     * inline. Caps unbounded fan-out from runaway loops.
+     */
     fun prewarm(input: LinkCreateInput, key: String? = null) {
         if (input.title.isEmpty()) return
         scope.launch {
             val ck = cacheKey(input, key)
             evictExpired()
-            cacheMutex.withLock {
-                if (prewarmCache.containsKey(ck)) return@launch
+            val shouldRun = cacheMutex.withLock {
+                if (prewarmCache.containsKey(ck)) return@withLock false
+                if (prewarmInflight >= prewarmMaxInflight) return@withLock false
+                prewarmInflight++
                 prewarmCache[ck] = PrewarmEntry()
+                true
             }
+            if (!shouldRun) return@launch
             val result = doCreate(input)
             val waiters = cacheMutex.withLock {
+                prewarmInflight--
                 val e = prewarmCache[ck]
                 if (e != null) {
                     if (result.isFailure) {

@@ -118,6 +118,18 @@ class MyFcm : FirebaseMessagingService() {
 - Battery Optimization may delay updates on aggressive OEMs (Xiaomi, Huawei). Android lacks Apple-style update budgets.
 - ProgressStyle requires API 34+; older Android uses BigTextStyle.
 
+## Engagement time (Wave 75 — 4.1.0)
+
+`SendoraCloud.trackScreen(name, properties)` emits `screen.viewed` and flushes
+the previous screen's `app.engagement { durationMs, screen, sessionId }`
+(foreground-only). New `autoTrackEngagement` config flag (default on).
+ProcessLifecycleOwner `onStop` flushes + pauses, `onStart` resumes. Durations
+use `SystemClock.elapsedRealtime()` (monotonic — immune to wall-clock / NTP
+jumps); state guarded by an `engLock` monitor; spans <250ms dropped, >6h
+clamped, emit outside the lock. **No Activity/Fragment auto-instrumentation** —
+you name real screens so the data stays clean. Matches GA4
+`engagement_time_msec`; powers `/analytics/engagement`.
+
 ## Publish
 
 Tag a new version; JitPack builds on first consumer request. Gradle wrapper must be committed.
