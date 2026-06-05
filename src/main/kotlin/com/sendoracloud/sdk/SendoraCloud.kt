@@ -265,6 +265,15 @@ object SendoraCloud {
         return parseDeepLink(uri)
     }
 
+    /**
+     * Legacy / attribution-only deferred-deeplink path: posts to
+     * `/attribution/deferred` using the 16-hex `FingerprintGenerator` hash.
+     * For Branch-parity deferred matching prefer
+     * `SendoraCloud.links?.matchDeferred(...)`, which hits `/sdk/links/match`
+     * with the 64-hex canonical `computeDeviceFingerprint`. The two paths use
+     * DIFFERENT fingerprint recipes and therefore never cross-match — do not
+     * mix them for the same install. Kept for backward compatibility.
+     */
     fun checkDeferredDeepLink(callback: (SendoraCloudLinkData?) -> Unit) {
         val cfg = config
         val store = storage
@@ -317,9 +326,17 @@ object SendoraCloud {
             put("properties", properties ?: emptyMap<String, Any>())
             put("context", mapOf(
                 "device" to (deviceContext?.toMap() ?: emptyMap()),
-                "sdk" to mapOf("name" to "sendora-android", "version" to "4.1.0"),
+                "sdk" to mapOf("name" to "sendora-android", "version" to "4.2.0"),
             ))
             put("sessionId", storage?.sessionId ?: "")
+            // Fixed placeholder, not per-purpose granularity. `consent` here
+            // is a single boolean gate (see SendoraCloudConsent); the array is
+            // a constant marker matching the web/iOS SDKs, NOT a list of the
+            // specific purposes the user granted. The backend must not gate
+            // purpose-scoped processing (e.g. marketing vs analytics) on this
+            // value — buffering already happens client-side until consent is
+            // granted. Make SendoraCloudConsent purpose-aware before relying
+            // on this array for anything finer-grained.
             put("consent", listOf("analytics"))
             currentUserId?.let { put("userId", it) }
             currentIdentityToken?.let { put("identityToken", it) }

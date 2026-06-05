@@ -36,7 +36,6 @@ internal class ApiClient(
     private val consecutiveFailures = AtomicInteger(0)
     private val nextAllowedAfter = AtomicLong(0)
 
-    private val maxFailures = 10
     private val maxBackoffMs = 60_000L
 
     /**
@@ -223,8 +222,17 @@ internal class ApiClient(
         }
     }
 
+    /**
+     * Circuit breaker gate. Purely time-based (half-open by construction):
+     * each failure pushes `nextAllowedAfter` forward with exponential backoff
+     * (capped at `maxBackoffMs`), and once that window elapses ONE probe
+     * request is allowed through. A probe success calls `recordSuccess()` and
+     * resets the breaker; a probe failure re-arms the backoff. We deliberately
+     * do NOT hard-trip on `consecutiveFailures` alone — a count-only block can
+     * never reset (no request is attempted → no success → no reset), which
+     * wedged the client for the whole process lifetime after a transient blip.
+     */
     private fun shouldSkip(): Boolean {
-        if (consecutiveFailures.get() > maxFailures) return true
         return System.currentTimeMillis() < nextAllowedAfter.get()
     }
 

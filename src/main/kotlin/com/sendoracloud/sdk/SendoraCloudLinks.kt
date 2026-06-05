@@ -67,6 +67,15 @@ class SendoraCloudLinks internal constructor(
         val title: String,
         /** **Optional as of 3.8.0** — backend defaults from your project's apps registry. */
         val fallbackUrl: String? = null,
+        /**
+         * How a **mobile visitor without the app installed** is routed
+         * (Adjust / Branch parity). `"auto"` (default) opens the app store
+         * when one is registered for the platform, else the web [fallbackUrl];
+         * `"store"` prefers the store; `"web"` forces the web [fallbackUrl]
+         * even when a store URL exists. `null` inherits the project default.
+         * Desktop is always web.
+         */
+        val noAppMode: String? = null,
         val iosDeepLinkPath: String? = null,
         val androidDeepLinkPath: String? = null,
         val linkData: Map<String, Any>? = null,
@@ -196,6 +205,7 @@ class SendoraCloudLinks internal constructor(
     private fun buildCreateBody(input: LinkCreateInput): Map<String, Any?> = buildMap {
         put("title", input.title)
         input.fallbackUrl?.let { put("fallbackUrl", it) }
+        input.noAppMode?.let { put("noAppMode", it) }
         input.iosDeepLinkPath?.let { put("iosDeepLinkPath", it) }
         input.androidDeepLinkPath?.let { put("androidDeepLinkPath", it) }
         input.linkData?.let { put("linkData", it) }

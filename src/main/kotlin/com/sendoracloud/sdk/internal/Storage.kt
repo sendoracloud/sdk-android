@@ -81,15 +81,28 @@ internal class Storage(context: Context) {
             e.apply()
         }
 
+    /**
+     * Process-lifetime fallback id, minted at most once when secure storage
+     * is unavailable. Cached so every caller in the same process sees ONE id
+     * (otherwise each getter returned a fresh UUID, fanning a single install
+     * out to multiple device ids across attribution/deferred reports and
+     * breaking backend dedup). Guarded by `_sessionLock`.
+     */
+    private var ephemeralDeviceId: String? = null
+
     val deviceId: String
         get() = synchronized(_sessionLock) {
             val sp = securePrefs
             if (sp == null) {
-                // Cannot persist — return a per-process random id so
-                // events still have a stable id within the process,
-                // but log loudly so the developer notices.
+                // Cannot persist — return a per-process random id so events
+                // still have a STABLE id within the process. Cache it so all
+                // callers agree; log loudly the first time so the developer
+                // notices.
+                ephemeralDeviceId?.let { return it }
                 SendoraCloudLogger.error("deviceId requested but secure storage unavailable; returning ephemeral id")
-                return UUID.randomUUID().toString()
+                val ephemeral = UUID.randomUUID().toString()
+                ephemeralDeviceId = ephemeral
+                return ephemeral
             }
             val existing = sp.getString("device_id", null)
             if (existing != null) return existing
@@ -99,7 +112,10 @@ internal class Storage(context: Context) {
         }
 
     fun regenerateDeviceId() {
-        securePrefs?.edit()?.remove("device_id")?.apply()
+        synchronized(_sessionLock) {
+            ephemeralDeviceId = null
+            securePrefs?.edit()?.remove("device_id")?.apply()
+        }
     }
 
     // --- Auth Service tokens (EncryptedSharedPreferences ONLY) ---

@@ -130,6 +130,15 @@ clamped, emit outside the lock. **No Activity/Fragment auto-instrumentation** â€
 you name real screens so the data stays clean. Matches GA4
 `engagement_time_msec`; powers `/analytics/engagement`.
 
+## Deep Links no-app routing mode (s58.208)
+
+`LinkCreateInput` gains an optional `noAppMode: String?` (`"auto"`/`"store"`/`"web"`)
+forwarded as `noAppMode` on `POST /sdk/links`. Controls what a **mobile visitor
+without the app installed** gets: `auto` (default) = store-if-registered-else-web,
+`store` = prefer store, `web` = force the web fallback even when a store URL
+exists. `null` inherits the project default. Additive + backwards-compatible.
+Desktop is always web.
+
 ## Publish
 
 Tag a new version; JitPack builds on first consumer request. Gradle wrapper must be committed.
