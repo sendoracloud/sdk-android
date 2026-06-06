@@ -567,10 +567,18 @@ class SendoraCloudAuth internal constructor(
      * Honors the project's configured grace period; wipes local identity on
      * success (the server has revoked the session). Fails when no user is
      * signed in or the request errors.
+     *
+     * Resolves a FRESH access token via [getAccessToken] first (refreshing a
+     * past-expiry cached token) — this is a one-shot destructive action, so a
+     * 401 from a stale token would silently strand the user with an undeleted
+     * account (the cause of the prod 401s when "delete" was tapped after the
+     * app sat idle). [getAccessToken] uses a separate `refreshMutex`, so calling
+     * it while holding `mutex` here does not deadlock.
      */
     suspend fun deleteAccount(): Result<AccountDeletionResult> = mutex.withLock {
-        val headers = bearerHeaders()
+        val token = getAccessToken()
             ?: return@withLock Result.failure(SendoraCloudAuthError.Unauthorized("Not signed in"))
+        val headers = mapOf("Authorization" to "Bearer $token")
         val res = client.delete("/auth-service/me", headers)
             ?: return@withLock Result.failure(SendoraCloudAuthError.Network("deleteAccount failed (network error)"))
         @Suppress("UNCHECKED_CAST")

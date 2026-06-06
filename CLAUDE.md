@@ -138,6 +138,16 @@ Apple App Store Guideline 5.1.1(v). `Result<AccountDeletionResult>` — `status`
 at `scheduledPurgeAt`, cancellable by signing back in within grace). Wipes local
 identity on success. Grace period is a per-project Auth setting.
 
+**4.3.1 — refresh-before-delete.** `deleteAccount()` now resolves a fresh access
+token via `getAccessToken()` (refreshing a past-expiry cached token) BEFORE the
+`DELETE` instead of reading the raw cached token via `bearerHeaders()`. Safe
+under the held `mutex` because `getAccessToken()`/`refreshAccessToken()` use a
+separate `refreshMutex`. This is a one-shot destructive action — a 401 from a
+stale token (typical when a user taps "delete" after the app sat idle past the
+short access TTL) would silently strand them with an undeleted account (cause of
+prod `DELETE /auth-service/me 401`s). **Host-app note:** wire your delete button
+to `auth.deleteAccount()` — NOT `consent.requestDeletion()` (GDPR ledger only).
+
 ## Deep Links no-app routing mode (s58.208)
 
 `LinkCreateInput` gains an optional `noAppMode: String?` (`"auto"`/`"store"`/`"web"`)
