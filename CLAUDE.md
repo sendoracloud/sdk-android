@@ -130,6 +130,14 @@ clamped, emit outside the lock. **No Activity/Fragment auto-instrumentation** â€
 you name real screens so the data stays clean. Matches GA4
 `engagement_time_msec`; powers `/analytics/engagement`.
 
+## Account deletion (s58.209)
+
+`auth.deleteAccount()` (suspend, Bearer) deletes the signed-in user's account for
+Apple App Store Guideline 5.1.1(v). `Result<AccountDeletionResult>` â€” `status` is
+`"purged"` (grace 0) or `"pending"` (disabled + sessions revoked now; hard-deleted
+at `scheduledPurgeAt`, cancellable by signing back in within grace). Wipes local
+identity on success. Grace period is a per-project Auth setting.
+
 ## Deep Links no-app routing mode (s58.208)
 
 `LinkCreateInput` gains an optional `noAppMode: String?` (`"auto"`/`"store"`/`"web"`)

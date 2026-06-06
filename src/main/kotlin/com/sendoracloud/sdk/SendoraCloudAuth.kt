@@ -551,6 +551,44 @@ class SendoraCloudAuth internal constructor(
         client.delete("/auth-service/sessions/me", headers)
     }
 
+    /**
+     * Outcome of [deleteAccount]. [status] is `"purged"` (hard-deleted now,
+     * grace = 0) or `"pending"` (deactivated + sessions revoked now, hard
+     * delete scheduled at [scheduledPurgeAt]; cancellable by signing back in).
+     */
+    data class AccountDeletionResult(
+        val status: String,
+        val scheduledPurgeAt: String?,
+        val graceDays: Int,
+    )
+
+    /**
+     * Delete the signed-in user's account (Apple App Store Guideline 5.1.1(v)).
+     * Honors the project's configured grace period; wipes local identity on
+     * success (the server has revoked the session). Fails when no user is
+     * signed in or the request errors.
+     */
+    suspend fun deleteAccount(): Result<AccountDeletionResult> = mutex.withLock {
+        val headers = bearerHeaders()
+            ?: return@withLock Result.failure(SendoraCloudAuthError.Unauthorized("Not signed in"))
+        val res = client.delete("/auth-service/me", headers)
+            ?: return@withLock Result.failure(SendoraCloudAuthError.Network("deleteAccount failed (network error)"))
+        @Suppress("UNCHECKED_CAST")
+        val data = res["data"] as? Map<String, Any?>
+        if (data == null && res["error"] != null) {
+            @Suppress("UNCHECKED_CAST")
+            val msg = (res["error"] as? Map<String, Any?>)?.get("message") as? String ?: "deleteAccount failed"
+            return@withLock Result.failure(SendoraCloudAuthError.Network(msg))
+        }
+        // Account is gone / deactivated server-side — drop local identity.
+        wipeLocalIdentity()
+        Result.success(AccountDeletionResult(
+            status = data?.get("status") as? String ?: "pending",
+            scheduledPurgeAt = data?.get("scheduledPurgeAt") as? String,
+            graceDays = (data?.get("graceDays") as? Number)?.toInt() ?: 0,
+        ))
+    }
+
     private fun bearerHeaders(): Map<String, String>? {
         val token = storage.authAccessToken ?: return null
         return mapOf("Authorization" to "Bearer $token")
