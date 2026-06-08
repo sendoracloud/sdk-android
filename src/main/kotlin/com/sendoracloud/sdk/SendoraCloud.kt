@@ -326,7 +326,7 @@ object SendoraCloud {
             put("properties", properties ?: emptyMap<String, Any>())
             put("context", mapOf(
                 "device" to (deviceContext?.toMap() ?: emptyMap()),
-                "sdk" to mapOf("name" to "sendora-android", "version" to "4.3.1"),
+                "sdk" to mapOf("name" to "sendora-android", "version" to "4.4.0"),
             ))
             put("sessionId", storage?.sessionId ?: "")
             // Fixed placeholder, not per-purpose granularity. `consent` here

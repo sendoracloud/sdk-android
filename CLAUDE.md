@@ -118,6 +118,16 @@ class MyFcm : FirebaseMessagingService() {
 - Battery Optimization may delay updates on aggressive OEMs (Xiaomi, Huawei). Android lacks Apple-style update budgets.
 - ProgressStyle requires API 34+; older Android uses BigTextStyle.
 
+## 4.4.0 — appVersion in device context (ADR-022)
+
+`DeviceInfo.toMap()` now also emits `appVersion` (already collected from
+`PackageManager.versionName`) alongside the existing `type` / `os` / `osVersion`
+/ `model`. So every event's `context.device` carries the host app version,
+powering the dashboard Analytics → Audience app-version breakdown. No config or
+host-app change — auto-detected from the package info. The native SDKs already
+led on device context; this just surfaces the app version that was being
+collected but not sent.
+
 ## Engagement time (Wave 75 — 4.1.0)
 
 `SendoraCloud.trackScreen(name, properties)` emits `screen.viewed` and flushes
