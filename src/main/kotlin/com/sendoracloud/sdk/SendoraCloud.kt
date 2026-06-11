@@ -125,6 +125,7 @@ object SendoraCloud {
 
         val store = Storage(appContext)
         storage = store
+        store.ensureSchemaVersion()
         currentUserId = store.cachedUserId
 
         val device = DeviceContext.collect(appContext)
@@ -136,8 +137,11 @@ object SendoraCloud {
 
         val queue = EventQueue(store, finalConfig.flushAt, finalConfig.maxQueueSize)
         queue.setFlushHandler { events ->
-            if (!consent.isGranted) return@setFlushHandler
-            flushEvents(events, client)
+            // Return false → events stay queued (ACK-before-remove). When consent
+            // isn't granted yet, keep them buffered until consent.subscribe()
+            // re-flushes on grant rather than dropping the batch.
+            if (!consent.isGranted) false
+            else flushEvents(events, client)
         }
         queue.startTimer(finalConfig.flushInterval)
         eventQueue = queue
@@ -326,7 +330,7 @@ object SendoraCloud {
             put("properties", properties ?: emptyMap<String, Any>())
             put("context", mapOf(
                 "device" to (deviceContext?.toMap() ?: emptyMap()),
-                "sdk" to mapOf("name" to "sendora-android", "version" to "4.4.0"),
+                "sdk" to mapOf("name" to SDK_NAME, "version" to SDK_VERSION),
             ))
             put("sessionId", storage?.sessionId ?: "")
             // Fixed placeholder, not per-purpose granularity. `consent` here
@@ -338,7 +342,16 @@ object SendoraCloud {
             // granted. Make SendoraCloudConsent purpose-aware before relying
             // on this array for anything finer-grained.
             put("consent", listOf("analytics"))
-            currentUserId?.let { put("userId", it) }
+            val uid = currentUserId
+            if (uid != null) {
+                put("userId", uid)
+            } else {
+                // No identified user yet — attach the stable device id as
+                // anonymousId so the backend's coalesce(user_id, anonymous_id)
+                // identity (s58.219) counts this install instead of
+                // undercounting Android anonymous users. Mirrors sdk-ios.
+                storage?.deviceId?.let { put("anonymousId", it) }
+            }
             currentIdentityToken?.let { put("identityToken", it) }
         }
         scope.launch { eventQueue?.add(event) }
@@ -508,11 +521,19 @@ object SendoraCloud {
         trackEvent("session.ended", mapOf("sessionId" to (storage?.sessionId ?: "")))
     }
 
-    private fun flushEvents(events: List<Map<String, Any?>>, client: ApiClient) {
-        if (events.isEmpty()) return
-        scope.launch {
-            if (events.size == 1) client.post("/events", events.first())
-            else client.postBatch("/events/batch", events)
+    /**
+     * Send a batch and report whether the backend ACCEPTED it. The EventQueue
+     * only removes the events once this returns true (ACK-before-remove,
+     * ADR-023 §7) — a network error / 5xx returns false and the batch stays
+     * queued for the next flush instead of being silently dropped.
+     */
+    private suspend fun flushEvents(events: List<Map<String, Any?>>, client: ApiClient): Boolean {
+        if (events.isEmpty()) return true
+        return if (events.size == 1) {
+            val response = client.post("/events", events.first())
+            (response?.get("success") as? Boolean) == true
+        } else {
+            client.postBatch("/events/batch", events)
         }
     }
 }

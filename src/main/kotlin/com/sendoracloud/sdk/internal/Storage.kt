@@ -54,6 +54,20 @@ internal class Storage(context: Context) {
      *  surface a configuration error to the consumer if false. */
     val isSecureAvailable: Boolean get() = securePrefs != null
 
+    /**
+     * On-device schema/format-version marker (ADR-023 §5). Non-sensitive →
+     * plain SharedPreferences (NOT EncryptedSharedPreferences). Written once
+     * at init while the format is still v1, so a future SDK can branch a
+     * read-old→write-new migration on it (`if (stored < N) migrate()`)
+     * instead of guessing. New key — read nowhere yet; never rename existing
+     * keys (frozen per ADR-023 §3.4).
+     */
+    fun ensureSchemaVersion() {
+        if (!prefs.contains("schema_version")) {
+            prefs.edit().putString("schema_version", "1").apply()
+        }
+    }
+
     var isFirstLaunch: Boolean
         get() = !prefs.getBoolean("launched", false)
         set(value) { prefs.edit().putBoolean("launched", !value).apply() }

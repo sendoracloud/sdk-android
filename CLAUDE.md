@@ -118,6 +118,44 @@ class MyFcm : FirebaseMessagingService() {
 - Battery Optimization may delay updates on aggressive OEMs (Xiaomi, Huawei). Android lacks Apple-style update budgets.
 - ProgressStyle requires API 34+; older Android uses BigTextStyle.
 
+## 4.5.0 — SDK/API compatibility (ADR-023)
+
+4.5.0 — ADR-023: single-source SDK_VERSION + X-Sendora-SDK-{Name,Version}
+headers + schema_version marker; fix event-queue ACK-before-remove durability;
+emit anonymousId for anon users (parity with iOS).
+
+The version string used to be hardcoded as `"4.4.0"` in two places (the event
+body `context.sdk` and `build.gradle.kts`) — drift risk. The ONLY source of
+truth is now `internal/SdkVersion.kt` (`SDK_VERSION` / `SDK_NAME`); the event
+body reads it and `build.gradle.kts` carries a comment to keep its `version` in
+lockstep. `buildConfig` stays disabled — a single Kotlin const is the source of
+truth (no BuildConfig machinery). Every HTTP request (`ApiClient`, both the
+plain `request` and `doRichRequest` builders) now also sends
+`X-Sendora-SDK-Name: sendora-android` + `X-Sendora-SDK-Version: <SDK_VERSION>`
+so the backend gets a version signal on non-event routes too (auth/links/push)
+— ignored today. On init, `Storage.ensureSchemaVersion()` writes plain
+SharedPreferences (`sendora_sdk`) key `schema_version = "1"` if absent
+(non-sensitive → plain tier, NOT EncryptedSharedPreferences), giving a future
+in-place upgrade a hook to branch a local-storage migration. Read nowhere yet;
+no existing key renamed (frozen per ADR-023 §3.4).
+
+**Bug fix — event-queue durability (ACK-before-remove).**
+`EventQueue.performFlush()` used to `events.clear()` BEFORE the HTTP call, so a
+flush 5xx / network error permanently lost the batch. It now snapshots the
+front of the queue under the lock, hands it to the flush handler OUTSIDE the
+lock (so the HTTP round-trip never blocks `add()`), and only removes exactly
+those snapshotted events from the FRONT (FIFO) AFTER the handler reports
+success — re-persisting the remainder. On failure everything stays queued for
+the next flush. An `isFlushing` guard prevents a timer-tick + threshold flush
+from double-sending. The flush handler signature changed to
+`suspend (events) -> Boolean` (true = backend accepted). Mirrors iOS
+`EventQueue.swift`.
+
+**Bug fix — emit anonymousId for anon users.** When there's no `userId`, the
+event body now attaches `anonymousId = storage.deviceId` (only when no userId).
+Matches sdk-ios. Without it the backend's `coalesce(user_id, anonymous_id)`
+identity (s58.219) undercounted Android anonymous users.
+
 ## 4.4.0 — appVersion in device context (ADR-022)
 
 `DeviceInfo.toMap()` now also emits `appVersion` (already collected from

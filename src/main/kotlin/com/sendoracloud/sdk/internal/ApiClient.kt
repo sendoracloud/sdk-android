@@ -128,6 +128,11 @@ internal class ApiClient(
             conn.requestMethod = method
             conn.setRequestProperty("Content-Type", "application/json")
             conn.setRequestProperty("X-API-Key", apiKey)
+            // SDK-version telemetry (ADR-023 §2.1). Additive — backend ignores
+            // today; enables per-version observability on auth/links/push calls
+            // that carry no version signal in their body.
+            conn.setRequestProperty("X-Sendora-SDK-Name", SDK_NAME)
+            conn.setRequestProperty("X-Sendora-SDK-Version", SDK_VERSION)
             conn.connectTimeout = 5_000
             conn.readTimeout = 5_000
             if (body != null) {
@@ -193,6 +198,9 @@ internal class ApiClient(
             conn.requestMethod = method
             conn.setRequestProperty("Content-Type", "application/json")
             conn.setRequestProperty("X-API-Key", apiKey)
+            // SDK-version telemetry (ADR-023 §2.1). Additive — backend ignores today.
+            conn.setRequestProperty("X-Sendora-SDK-Name", SDK_NAME)
+            conn.setRequestProperty("X-Sendora-SDK-Version", SDK_VERSION)
             extraHeaders?.forEach { (k, v) -> conn.setRequestProperty(k, v) }
             conn.connectTimeout = 5_000
             conn.readTimeout = 5_000
