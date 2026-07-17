@@ -366,6 +366,11 @@ class SendoraCloudAuth internal constructor(
         codeVerifier: String? = null,
         appleFirstName: String? = null,
         appleLastName: String? = null,
+        // ADR-025 link-in-place opt-in. When anonymous + `link = true`, an
+        // anon→social upgrade KEEPS the same user id (sub) — promoted in place
+        // (like Firebase linkWithCredential) instead of a device-takeover that
+        // mints a new id. No effect off-anon or on a collision.
+        link: Boolean = false,
     ): Result<SendoraCloudAuthUser> = mutex.withLock {
         if (!storage.isSecureAvailable) {
             return@withLock Result.failure(SendoraCloudAuthError.SecureStorageUnavailable("EncryptedSharedPreferences unavailable"))
@@ -388,26 +393,30 @@ class SendoraCloudAuth internal constructor(
                 })
             }
             prevAnonRefreshToken?.let { put("prevAnonRefreshToken", it) }
+            // ADR-025: opt into link-in-place (backend ignores it unless anon + new identity).
+            if (link) put("linkAnonymous", true)
         }
         callAuth("/auth-service/login/social", body)
     }
 
-    suspend fun signInWithGoogle(code: String, redirectUri: String) =
-        loginSocial(provider = "google", code = code, redirectUri = redirectUri)
+    suspend fun signInWithGoogle(code: String, redirectUri: String, link: Boolean = false) =
+        loginSocial(provider = "google", code = code, redirectUri = redirectUri, link = link)
 
     suspend fun signInWithGitHub(code: String, redirectUri: String) =
         loginSocial(provider = "github", code = code, redirectUri = redirectUri)
 
-    /** Apple Sign In. Pass `idToken` from the native flow + name fields on first sign-in. */
+    /** Apple Sign In. Pass `idToken` from the native flow + name fields on first sign-in. `link` = ADR-025 keep-the-sub on an anon upgrade. */
     suspend fun signInWithApple(
         idToken: String,
         firstName: String? = null,
         lastName: String? = null,
+        link: Boolean = false,
     ) = loginSocial(
         provider = "apple",
         idToken = idToken,
         appleFirstName = firstName,
         appleLastName = lastName,
+        link = link,
     )
 
     suspend fun signInWithMicrosoft(code: String, redirectUri: String) =

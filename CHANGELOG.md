@@ -1,5 +1,9 @@
 # Changelog
 
+## 4.6.0 — anon→social link-in-place (ADR-025)
+
+`loginSocial` / `signInWithApple` / `signInWithGoogle` gain an opt-in `link: Boolean = false`. When the device is anonymous and `link = true`, an anon→social upgrade sends `linkAnonymous` so the backend promotes the anonymous account **in place** — the user id (`sub`) is **preserved** (fires `auth.user_upgraded`) instead of a device-takeover that mints a new id (Firebase `linkWithCredential` parity). No effect when not anonymous, or on a collision (the social identity already belongs to another account, or the email is taken → falls back to the prior takeover/merge). Default-arg = source-compatible; additive.
+
 ## 4.1.0
 
 **Wave 51 — Play Install Referrer.**
