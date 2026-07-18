@@ -402,6 +402,32 @@ class SendoraCloudAuth internal constructor(
     suspend fun signInWithGoogle(code: String, redirectUri: String, link: Boolean = false) =
         loginSocial(provider = "google", code = code, redirectUri = redirectUri, link = link)
 
+    /**
+     * Google Play Games sign-in (email-less, player-keyed). Pass the
+     * serverAuthCode from
+     * `PlayGames.getGamesSignInClient(activity).requestServerSideAccess(webClientId, false)`
+     * — obtain it via the Play Games SDK (or the Sendora helper). `link = true`
+     * KEEPS the same user id when upgrading an anonymous device (ADR-025
+     * link-in-place); no effect off-anon or on a collision.
+     */
+    suspend fun signInWithPlayGames(serverAuthCode: String, link: Boolean = false): Result<SendoraCloudAuthUser> = mutex.withLock {
+        if (!storage.isSecureAvailable) {
+            return@withLock Result.failure(SendoraCloudAuthError.SecureStorageUnavailable("EncryptedSharedPreferences unavailable"))
+        }
+        // Device-takeover hint — same posture as loginSocial().
+        val prevAnonRefreshToken: String? = if (cachedUser?.isAnonymous == true) storage.authRefreshToken else null
+
+        if (cachedUser != null) wipeLocalIdentity()
+
+        val body = buildMap<String, Any> {
+            put("serverAuthCode", serverAuthCode)
+            prevAnonRefreshToken?.let { put("prevAnonRefreshToken", it) }
+            // ADR-025: opt into link-in-place (backend ignores it unless anon + new identity).
+            if (link) put("linkAnonymous", true)
+        }
+        callAuth("/auth-service/login/play-games", body)
+    }
+
     suspend fun signInWithGitHub(code: String, redirectUri: String) =
         loginSocial(provider = "github", code = code, redirectUri = redirectUri)
 

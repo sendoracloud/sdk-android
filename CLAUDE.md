@@ -120,6 +120,10 @@ class MyFcm : FirebaseMessagingService() {
 - Battery Optimization may delay updates on aggressive OEMs (Xiaomi, Huawei). Android lacks Apple-style update budgets.
 - ProgressStyle requires API 34+; older Android uses BigTextStyle.
 
+## 4.7.0 — Play Games sign-in
+
+`auth.signInWithPlayGames(serverAuthCode, link)` (suspend) — email-less, player-keyed sign-in. Pass the `serverAuthCode` from `PlayGames.getGamesSignInClient(activity).requestServerSideAccess(webClientId, false)`; forwards to `POST /auth-service/login/play-games`. Mirrors `loginSocial` (mutex, `isSecureAvailable` guard, anon-takeover hint → `prevAnonRefreshToken`, `link` → `linkAnonymous` for ADR-025 link-in-place, `callAuth`). Additive, SDK-only (not in golden wire contract). App obtains the auth-code via the Play Games SDK itself (no PGS dep forced). Ships alongside backend Phase 1 + RN 1.21.0.
+
 ## 4.6.0 — anon→social link-in-place (ADR-025)
 
 `loginSocial` / `signInWithApple` / `signInWithGoogle` gain an opt-in `link: Boolean = false`. When anonymous + `link = true`, the anon→social upgrade sends `linkAnonymous` so the backend promotes the anon row IN PLACE — `sub` PRESERVED (fires `auth.user_upgraded`) instead of a device-takeover (new id); Firebase `linkWithCredential` parity. No effect off-anon or on a collision. Default-arg = source-compatible; additive. Design: `docs/decisions/025-anon-social-link-in-place.md`.
@@ -213,4 +217,10 @@ Desktop is always web.
 
 ## Publish
 
-Tag a new version; JitPack builds on first consumer request. Gradle wrapper must be committed.
+Native SDKs ship via a git tag on the **separate public mirror** `github.com/sendoracloud/sdk-android` (JitPack builds on first consumer request), not npm. From a monorepo checkout:
+
+1. Guard the version: `node scripts/publish.mjs android` (verifies `build.gradle.kts` == `SdkVersion.kt`).
+2. Mirror it (operator, needs a clone of the mirror + push creds):
+   `node scripts/publish-native-mirror.mjs android --mirror-dir <clone> [--push] [--delete]` — rsyncs `packages/sdk-android/` → the mirror clone (excludes `build`/`.gradle`), commits, tags `<semver>`, pushes. **DRY by default**; `--push` executes; `--delete` makes the mirror an exact copy. It refuses a wrong/monorepo mirror dir or an existing tag. First time: `git clone https://github.com/sendoracloud/sdk-android.git <clone>`. The Gradle wrapper must be committed in the mirror.
+
+Raw path (equivalent): rsync source into the mirror clone, then `git tag <semver> && git push origin main --tags`.
