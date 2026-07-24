@@ -1,5 +1,30 @@
 # Changelog
 
+## 4.8.1 — fix JitPack build (commit the Gradle wrapper + settings)
+
+**Every prior version (≤4.8.0) failed to build on JitPack** with `./gradlew: No
+such file or directory` (exit 127): the package had `jitpack.yml`
+(`./gradlew :publishToMavenLocal`) + `build.gradle.kts` but was **missing the
+Gradle wrapper, `settings.gradle.kts`, and `gradle.properties`** — so JitPack had
+no `gradlew` to invoke, and even with one the `com.android.library` plugin had no
+version/repository to resolve from. This commits:
+
+- `gradlew` / `gradlew.bat` / `gradle/wrapper/gradle-wrapper.{jar,properties}` —
+  the canonical Gradle **8.2** wrapper (jar sha256 `a8451ee…46e4`, from
+  gradle/gradle@v8.2.0).
+- `settings.gradle.kts` — `pluginManagement` pins **AGP 8.2.2** + **Kotlin
+  1.9.22** (google/mavenCentral/gradlePluginPortal) + `dependencyResolutionManagement`.
+- `gradle.properties` — `android.useAndroidX=true` (required by the androidx.*
+  deps).
+
+Verified locally: `./gradlew projects` → BUILD SUCCESSFUL (wrapper + settings +
+AGP + Kotlin all resolve, `build.gradle.kts` evaluates), and
+`./gradlew :publishToMavenLocal --dry-run` reaches the AGP task graph and stops
+only at "SDK location not found" — the one thing JitPack's build servers supply.
+No SDK behaviour change; source-identical to 4.8.0 (which already carries
+`AuthUser.signupMethod`/`.lastLoginMethod`). 4.8.0's mirror tag is left as-is
+(un-buildable); **4.8.1 is the first buildable release with the method fields.**
+
 ## 4.1.0
 
 **Wave 51 — Play Install Referrer.**

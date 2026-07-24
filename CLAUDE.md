@@ -120,6 +120,10 @@ class MyFcm : FirebaseMessagingService() {
 - Battery Optimization may delay updates on aggressive OEMs (Xiaomi, Huawei). Android lacks Apple-style update budgets.
 - ProgressStyle requires API 34+; older Android uses BigTextStyle.
 
+## 4.8.1 — JitPack build fix (commit the Gradle wrapper + settings)
+
+Every version ≤4.8.0 failed to build on JitPack (`./gradlew: No such file or directory`, exit 127) — the package shipped `jitpack.yml` + `build.gradle.kts` but no wrapper, no `settings.gradle.kts`, no `gradle.properties`. Committed the canonical Gradle **8.2** wrapper (`gradlew`/`gradlew.bat`/`gradle/wrapper/*`, jar sha256 `a8451ee…46e4` from gradle/gradle@v8.2.0) + `settings.gradle.kts` (`pluginManagement` pins **AGP 8.2.2** + **Kotlin 1.9.22**) + `gradle.properties` (`android.useAndroidX=true`). Locally proven: `./gradlew projects` → BUILD SUCCESSFUL; `:publishToMavenLocal --dry-run` reaches the AGP graph, stops only at "SDK location not found" (JitPack supplies the SDK). Source-identical to 4.8.0; **4.8.1 is the first buildable release carrying the method fields.** (`ANDROID_HOME` + Android SDK are the only thing a local full build needs.)
+
 ## 4.8.0 — `signupMethod` + `lastLoginMethod` on the auth user
 
 `SendoraCloudAuthUser` gains two optional read-only fields: `signupMethod` (how the account was first created, immutable) + `lastLoginMethod` (most recent auth). Free-form provider tokens (`password`/`anonymous`/`google`/`apple`/`gamecenter`/`playgames`/`magic_link`/`passkey`/`oidc`/…). Backend populates them on the login/signup/social/game response (s58.266, mig 0094). Nullable with `= null` defaults on the data class (a cached user from a pre-4.8.0 build still constructs); parsed from both the response map and the rehydrate JSON, and written to the persisted JSON. Display-only — never an authorization signal. No frozen SharedPreferences key/header/wire-shape touched (ADR-023); not in the golden wire contract. `build.gradle.kts` + `SdkVersion.kt` bumped in lockstep. Parity with RN 1.24.0 / web 3.8.0 / iOS 4.9.0.
