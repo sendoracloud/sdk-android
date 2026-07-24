@@ -1,5 +1,29 @@
 # Changelog
 
+## 4.8.2 — fix 3 pre-existing Kotlin compile errors (first compiling release)
+
+With the wrapper landed (4.8.1) JitPack finally reached the Kotlin compiler and
+surfaced **three latent compile errors** — present since the code was written but
+never caught, because the SDK had never once compiled (JitPack died at the missing
+`gradlew`, and the monorepo has no Android SDK). Fixed:
+
+- `SendoraCloud.kt` — missing `import org.json.JSONObject` (used at the traits
+  size-cap). Added the import.
+- `SendoraCloudLinks.kt` — a prewarm *waiter* lambda (`(Result) -> Unit`, a
+  non-suspend type invoked via `forEach`) called the suspend `withContext` →
+  "Suspension functions can be called only within coroutine body". Now hops to
+  Main with a non-suspend `scope.launch(Dispatchers.Main) { … }`.
+- `SendoraCloudLiveActivities.kt` — `@SuppressWarnings("MissingPermission")`
+  (java.lang, not applicable to a Kotlin expression) → Kotlin `@Suppress(…)`.
+
+**Verified with a REAL build** (local Android SDK, `ANDROID_HOME` set):
+`./gradlew :publishToMavenLocal` → BUILD SUCCESSFUL, 27 tasks,
+`:compileReleaseKotlin` clean (4 benign warnings), AAR published to mavenLocal.
+This is JitPack's exact command. 4.8.1's mirror tag has a JitPack-cached *failed*
+build, so **4.8.2 is the first release that actually builds + is consumable** via
+`com.github.sendoracloud:sdk-android:4.8.2`. Still carries the s58.266 method
+fields. No behaviour change beyond making the code compile.
+
 ## 4.8.1 — fix JitPack build (commit the Gradle wrapper + settings)
 
 **Every prior version (≤4.8.0) failed to build on JitPack** with `./gradlew: No

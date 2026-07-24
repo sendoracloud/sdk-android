@@ -280,7 +280,11 @@ class SendoraCloudLinks internal constructor(
                     prewarmCache.remove(ck) // single-use
                     Pair(e, false)
                 } else if (e != null) {
-                    e.waiters.add { withContext(Dispatchers.Main) { onResult(it) } }
+                    // waiters is a plain (non-suspend) (Result) -> Unit, invoked
+                    // via forEach{} in the prewarm-completion coroutine — so it
+                    // can't call the suspend `withContext`. Hop to Main with a
+                    // (non-suspend) launch on the same scope instead.
+                    e.waiters.add { r -> scope.launch(Dispatchers.Main) { onResult(r) } }
                     Pair(e, true)
                 } else Pair(null, false)
             }
