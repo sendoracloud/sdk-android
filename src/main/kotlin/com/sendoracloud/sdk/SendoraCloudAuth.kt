@@ -50,6 +50,17 @@ data class SendoraCloudAuthUser(
     val emailVerified: Boolean,
     val name: String?,
     val isAnonymous: Boolean,
+    /**
+     * How this account was FIRST created (`signupMethod`, immutable) and how it
+     * MOST RECENTLY authenticated (`lastLoginMethod`). Free-form provider tokens
+     * (`password`/`anonymous`/`google`/`apple`/`gamecenter`/`playgames`/
+     * `magic_link`/`passkey`/`oidc`/…). Read-only, display-only — never an
+     * authorization signal. `null` against a backend older than s58.266, or for a
+     * row created before it (backfilled on next sign-in). Defaulted so cached
+     * users from a pre-4.8.0 build still construct. sdk-android 4.8.0+.
+     */
+    val signupMethod: String? = null,
+    val lastLoginMethod: String? = null,
 )
 
 sealed class SendoraCloudAuthError(message: String) : Throwable(message) {
@@ -108,6 +119,8 @@ class SendoraCloudAuth internal constructor(
                         emailVerified = obj.optBoolean("emailVerified", false),
                         name = obj.opt("name")?.takeIf { it != JSONObject.NULL } as? String,
                         isAnonymous = obj.optBoolean("isAnonymous", false),
+                        signupMethod = obj.opt("signupMethod")?.takeIf { it != JSONObject.NULL } as? String, // s58.266
+                        lastLoginMethod = obj.opt("lastLoginMethod")?.takeIf { it != JSONObject.NULL } as? String,
                     )
                     cachedExpiresAt = storage.authAccessExpiresAt
                     cachedUser?.let { onIdentityChange(it.id) }
@@ -769,6 +782,8 @@ class SendoraCloudAuth internal constructor(
             emailVerified = userMap["emailVerified"] as? Boolean ?: false,
             name = userMap["name"] as? String,
             isAnonymous = userMap["isAnonymous"] as? Boolean ?: false,
+            signupMethod = userMap["signupMethod"] as? String,   // s58.266
+            lastLoginMethod = userMap["lastLoginMethod"] as? String,
         )
         return user to tokensMap
     }
@@ -806,6 +821,8 @@ class SendoraCloudAuth internal constructor(
             put("emailVerified", user.emailVerified)
             put("name", user.name ?: JSONObject.NULL)
             put("isAnonymous", user.isAnonymous)
+            put("signupMethod", user.signupMethod ?: JSONObject.NULL) // s58.266
+            put("lastLoginMethod", user.lastLoginMethod ?: JSONObject.NULL)
         }.toString()
         storage.authUserJson = userJson
         onIdentityChange(user.id)

@@ -120,6 +120,10 @@ class MyFcm : FirebaseMessagingService() {
 - Battery Optimization may delay updates on aggressive OEMs (Xiaomi, Huawei). Android lacks Apple-style update budgets.
 - ProgressStyle requires API 34+; older Android uses BigTextStyle.
 
+## 4.8.0 — `signupMethod` + `lastLoginMethod` on the auth user
+
+`SendoraCloudAuthUser` gains two optional read-only fields: `signupMethod` (how the account was first created, immutable) + `lastLoginMethod` (most recent auth). Free-form provider tokens (`password`/`anonymous`/`google`/`apple`/`gamecenter`/`playgames`/`magic_link`/`passkey`/`oidc`/…). Backend populates them on the login/signup/social/game response (s58.266, mig 0094). Nullable with `= null` defaults on the data class (a cached user from a pre-4.8.0 build still constructs); parsed from both the response map and the rehydrate JSON, and written to the persisted JSON. Display-only — never an authorization signal. No frozen SharedPreferences key/header/wire-shape touched (ADR-023); not in the golden wire contract. `build.gradle.kts` + `SdkVersion.kt` bumped in lockstep. Parity with RN 1.24.0 / web 3.8.0 / iOS 4.9.0.
+
 ## 4.7.0 — Play Games sign-in
 
 `auth.signInWithPlayGames(serverAuthCode, link)` (suspend) — email-less, player-keyed sign-in. Pass the `serverAuthCode` from `PlayGames.getGamesSignInClient(activity).requestServerSideAccess(webClientId, false)`; forwards to `POST /auth-service/login/play-games`. Mirrors `loginSocial` (mutex, `isSecureAvailable` guard, anon-takeover hint → `prevAnonRefreshToken`, `link` → `linkAnonymous` for ADR-025 link-in-place, `callAuth`). Additive, SDK-only (not in golden wire contract). App obtains the auth-code via the Play Games SDK itself (no PGS dep forced). Ships alongside backend Phase 1 + RN 1.21.0.
