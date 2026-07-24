@@ -120,9 +120,26 @@ class MyFcm : FirebaseMessagingService() {
 - Battery Optimization may delay updates on aggressive OEMs (Xiaomi, Huawei). Android lacks Apple-style update budgets.
 - ProgressStyle requires API 34+; older Android uses BigTextStyle.
 
+## 4.9.0 — identity linking on an identified session (ADR-030) + signUp() fix
+
+Non-anonymous sibling of ADR-025. New `linkEmailPassword` / `linkSocial` (+
+`linkGoogle`/`linkApple`) / `linkPlayGames` attach a 2nd credential to an
+already-identified account (sub preserved), Bearer-authenticated (mirror
+`deleteAccount`'s `getAccessToken` → Bearer POST; safe under `mutex` since
+`getAccessToken` uses a separate `refreshMutex`), refresh the cached user in place
+via `updateLocalUser` — NO token rotation. The link response carries no tokens, so
+a dedicated `parseLinkedUser` (token-less) is used instead of `parseSuccess`.
+Collision → new `SendoraCloudAuthError.CredentialInUse`. Game Center is iOS-only,
+so Android ships `linkPlayGames` not `linkGameCenter`. **signUp() fix:** a non-anon
+`signUp()` used to wipe + fresh-signup (= duplicate account); now returns the new
+`AlreadyIdentified` error. `parseError` maps `NOT_ANONYMOUS` → `AlreadyIdentified`
+and `CREDENTIAL_IN_USE` → `CredentialInUse`. Compiles (`./gradlew
+:publishToMavenLocal` BUILD SUCCESSFUL). Additive, SDK-only (not in the golden
+contract). Parity with RN 1.25.0 / web 3.9.0 / iOS 4.10.0.
+
 ## 4.8.2 — fix 3 latent Kotlin compile errors (first compiling release)
 
-Once the 4.8.1 wrapper let JitPack reach the compiler, three never-caught compile errors surfaced (the SDK had literally never compiled): `SendoraCloud.kt` missing `import org.json.JSONObject`; a `SendoraCloudLinks.kt` prewarm waiter (non-suspend `(Result)->Unit` invoked via `forEach`) calling suspend `withContext` → switched to `scope.launch(Dispatchers.Main)`; `SendoraCloudLiveActivities.kt` `@SuppressWarnings` (java, not expression-applicable) → Kotlin `@Suppress`. **Verified with a real build** (local Android SDK + `ANDROID_HOME`): `./gradlew :publishToMavenLocal` → BUILD SUCCESSFUL, AAR published, `:compileReleaseKotlin` clean. 4.8.1's tag has a JitPack-cached failed build, so **4.8.2 is the first consumable release**. ⚠ **The monorepo has no Android SDK in CI, so nothing catches a Kotlin compile error before a JitPack publish** — build the module against a local Android SDK (`ANDROID_HOME=… ./gradlew :publishToMavenLocal`) before every mirror push.
+Once the 4.8.1 wrapper let JitPack reach the compiler, three never-caught compile errors surfaced (the SDK had literally never compiled): `SendoraCloud.kt` missing `import org.json.JSONObject`; a `SendoraCloudLinks.kt` prewarm waiter (non-suspend `(Result)->Unit` invoked via `forEach`) calling suspend `withContext` → switched to `scope.launch(Dispatchers.Main)`; `SendoraCloudLiveActivities.kt` `@SuppressWarnings` (java, not expression-applicable) → Kotlin `@Suppress`. **Verified with a real build** (local Android SDK + `ANDROID_HOME`): `./gradlew :publishToMavenLocal` → BUILD SUCCESSFUL, AAR published, `:compileReleaseKotlin` clean. 4.8.1's tag has a JitPack-cached failed build, so **4.8.2 is the first consumable release**. **CI now compiles this module** — the `Android SDK build` job in `.github/workflows/ci.yml` runs `./gradlew :publishToMavenLocal` (JitPack's exact command) on every PR against the runner's preinstalled Android SDK, so a Kotlin compile error fails CI instead of a JitPack publish. Still smart to build locally (`ANDROID_HOME=… ./gradlew :publishToMavenLocal`) before a mirror push, but the net is no longer open.
 
 ## 4.8.1 — JitPack build fix (commit the Gradle wrapper + settings)
 

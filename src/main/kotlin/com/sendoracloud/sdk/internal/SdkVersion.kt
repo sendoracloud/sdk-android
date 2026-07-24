@@ -10,7 +10,7 @@ package com.sendoracloud.sdk.internal
  * this module (`buildFeatures { buildConfig = false }`), so wiring a
  * BuildConfig field would add machinery for no benefit.
  */
-internal const val SDK_VERSION = "4.8.2"
+internal const val SDK_VERSION = "4.9.0"
 
 /** SDK name reported in telemetry + the `X-Sendora-SDK-Name` header. */
 internal const val SDK_NAME = "sendora-android"

@@ -65,6 +65,13 @@ data class SendoraCloudAuthUser(
 
 sealed class SendoraCloudAuthError(message: String) : Throwable(message) {
     class EmailAlreadyTaken(message: String) : SendoraCloudAuthError(message)
+    /** `signUp()` on a session already signed in with an identity (ADR-030 §4).
+     *  Use `linkEmailPassword()` / `linkGoogle()` / … to add a credential to THIS
+     *  account, or sign out first — do not create a second account. */
+    class AlreadyIdentified(message: String) : SendoraCloudAuthError(message)
+    /** A credential passed to `link*()` is already attached to a DIFFERENT
+     *  account (ADR-030 §2). Sendora never auto-merges two real accounts. */
+    class CredentialInUse(message: String) : SendoraCloudAuthError(message)
     class Unauthorized(message: String) : SendoraCloudAuthError(message)
     class Network(message: String) : SendoraCloudAuthError(message)
     class SecureStorageUnavailable(message: String) : SendoraCloudAuthError(message)
@@ -197,11 +204,14 @@ class SendoraCloudAuth internal constructor(
             name?.let { body["name"] = it }
             return@withLock callAuth("/auth-service/upgrade", body)
         }
-        // Non-anonymous identified state — wipe BEFORE the network call
-        // so any track() during the auth round-trip can't attach to
-        // the prior identity.
+        // ADR-030 §4: already signed in with an identity. signUp() would orphan
+        // the current account by minting a second one — refuse and point at
+        // link*() (was: silently wiped + fresh-signup = duplicate account). A
+        // genuinely signed-out caller (no cachedUser) still falls through.
         if (cachedUser != null && cachedUser?.isAnonymous == false) {
-            wipeLocalIdentity()
+            return@withLock Result.failure(SendoraCloudAuthError.AlreadyIdentified(
+                "Already signed in. Use linkEmailPassword() to add a password to this account, or sign out first."
+            ))
         }
         val body = mutableMapOf<String, Any?>("email" to email, "password" to password)
         name?.let { body["name"] = it }
@@ -645,6 +655,100 @@ class SendoraCloudAuth internal constructor(
         ))
     }
 
+    // --- Identity linking (ADR-030) ---
+    //
+    // Attach a SECOND credential to the CURRENT signed-in account, preserving the
+    // same user id (sub). Unlike signUp()/loginSocial(link) — which preserve the
+    // sub only from an ANONYMOUS session — these operate on an already-identified
+    // account. Bearer-authenticated; NO token rotation (the cached user is
+    // refreshed in place). Collision -> [SendoraCloudAuthError.CredentialInUse]
+    // (never merges). Primary use: one account across platforms — a Play Games
+    // player links email/Google, then signs in on iOS to the SAME sub.
+
+    /** Link email + password to the current account (sub preserved). */
+    suspend fun linkEmailPassword(email: String, password: String): Result<SendoraCloudAuthUser> =
+        linkCredential("/auth-service/me/link/email", mapOf("email" to email, "password" to password))
+
+    /** Link an OAuth social identity. Pass a native `idToken` OR a web `code` + `redirectUri`. */
+    suspend fun linkSocial(
+        provider: String,
+        idToken: String? = null,
+        code: String? = null,
+        redirectUri: String? = null,
+    ): Result<SendoraCloudAuthUser> {
+        val body = mutableMapOf<String, Any?>("provider" to provider)
+        idToken?.let { body["idToken"] = it }
+        code?.let { body["code"] = it }
+        redirectUri?.let { body["redirectUri"] = it }
+        return linkCredential("/auth-service/me/link/social", body)
+    }
+
+    /** Convenience: link a Google identity (native `idToken`, or web `code`+`redirectUri`). */
+    suspend fun linkGoogle(idToken: String? = null, code: String? = null, redirectUri: String? = null): Result<SendoraCloudAuthUser> =
+        linkSocial("google", idToken, code, redirectUri)
+
+    /** Convenience: link an Apple identity. */
+    suspend fun linkApple(idToken: String? = null, code: String? = null, redirectUri: String? = null): Result<SendoraCloudAuthUser> =
+        linkSocial("apple", idToken, code, redirectUri)
+
+    /** Link a Google Play Games identity to the current account. Pass the
+     *  `serverAuthCode` from `requestServerSideAccess` (same input as
+     *  [signInWithPlayGames]). */
+    suspend fun linkPlayGames(serverAuthCode: String): Result<SendoraCloudAuthUser> =
+        linkCredential("/auth-service/me/link/play-games", mapOf("serverAuthCode" to serverAuthCode))
+
+    /** Shared link executor. Resolves a fresh access token, POSTs the credential
+     *  with the Bearer header, then refreshes the cached user IN PLACE (no token
+     *  rotation — the sub is unchanged). Mirrors [deleteAccount]'s Bearer flow;
+     *  [getAccessToken] uses a separate refreshMutex, so calling it while holding
+     *  `mutex` here does not deadlock. */
+    private suspend fun linkCredential(path: String, body: Map<String, Any?>): Result<SendoraCloudAuthUser> = mutex.withLock {
+        val token = getAccessToken()
+            ?: return@withLock Result.failure(SendoraCloudAuthError.Unauthorized("Sign in before linking a credential"))
+        val headers = mapOf("Authorization" to "Bearer $token")
+        val response = client.post(path, body, headers)
+        val err = parseError(response)
+        if (err != null) return@withLock Result.failure(err)
+        val user = parseLinkedUser(response)
+            ?: return@withLock Result.failure(SendoraCloudAuthError.Unknown("Malformed link response"))
+        updateLocalUser(user)
+        Result.success(user)
+    }
+
+    /** Parse the user off a link response (which carries NO tokens, so
+     *  [parseSuccess] — which requires tokens — can't be used). */
+    @Suppress("UNCHECKED_CAST")
+    private fun parseLinkedUser(response: Map<String, Any?>?): SendoraCloudAuthUser? {
+        val data = response?.get("data") as? Map<String, Any?> ?: return null
+        val userMap = data["user"] as? Map<String, Any?> ?: return null
+        val id = userMap["id"] as? String
+        if (id.isNullOrEmpty()) return null
+        return SendoraCloudAuthUser(
+            id = id,
+            email = userMap["email"] as? String,
+            emailVerified = userMap["emailVerified"] as? Boolean ?: false,
+            name = userMap["name"] as? String,
+            isAnonymous = userMap["isAnonymous"] as? Boolean ?: false,
+            signupMethod = userMap["signupMethod"] as? String,
+            lastLoginMethod = userMap["lastLoginMethod"] as? String,
+        )
+    }
+
+    /** Refresh the cached user after a link — the sub is unchanged, so only the
+     *  user object + its stored copy change (no token/identity rotation). */
+    private fun updateLocalUser(user: SendoraCloudAuthUser) {
+        cachedUser = user
+        storage.authUserJson = JSONObject().apply {
+            put("id", user.id)
+            put("email", user.email ?: JSONObject.NULL)
+            put("emailVerified", user.emailVerified)
+            put("name", user.name ?: JSONObject.NULL)
+            put("isAnonymous", user.isAnonymous)
+            put("signupMethod", user.signupMethod ?: JSONObject.NULL)
+            put("lastLoginMethod", user.lastLoginMethod ?: JSONObject.NULL)
+        }.toString()
+    }
+
     private fun bearerHeaders(): Map<String, String>? {
         val token = storage.authAccessToken ?: return null
         return mapOf("Authorization" to "Bearer $token")
@@ -759,6 +863,8 @@ class SendoraCloudAuth internal constructor(
         val code = error?.get("code") as? String ?: ""
         val message = error?.get("message") as? String ?: "Auth request failed"
         return when (code) {
+            "NOT_ANONYMOUS" -> SendoraCloudAuthError.AlreadyIdentified(message)
+            "CREDENTIAL_IN_USE" -> SendoraCloudAuthError.CredentialInUse(message)
             "CONFLICT", "EMAIL_ALREADY_TAKEN" -> SendoraCloudAuthError.EmailAlreadyTaken(message)
             "UNAUTHORIZED" -> SendoraCloudAuthError.Unauthorized(message)
             else -> SendoraCloudAuthError.Unknown("$code: $message")

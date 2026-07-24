@@ -1,5 +1,25 @@
 # Changelog
 
+## 4.9.0 — identity linking on an identified session (ADR-030) + signUp() fix
+
+**New: link a SECOND credential to an already-signed-in account, preserving the
+sub** — the cross-platform account-unification primitive. `auth.linkEmailPassword`,
+`auth.linkSocial` (+ `auth.linkGoogle` / `auth.linkApple`), `auth.linkPlayGames`.
+All require a signed-in session (Bearer), preserve the sub, do NOT rotate tokens,
+and refresh the cached user in place. Collision (the credential already belongs to
+another account) → new `SendoraCloudAuthError.CredentialInUse` (never merges). Use
+to make one account reachable across platforms (a Play Games player on Android
+links email/Google, then signs in on iOS to the SAME sub).
+
+**Fix: `signUp()` on an already-identified session** now returns the new
+`SendoraCloudAuthError.AlreadyIdentified` instead of silently wiping the session +
+minting a duplicate account. `parseError` also maps the backend's new
+`NOT_ANONYMOUS` code → `AlreadyIdentified` and `CREDENTIAL_IN_USE` →
+`CredentialInUse`.
+
+Additive, SDK-only (not in the golden wire contract); no frozen key/header touched.
+Parity with RN 1.25.0 / web 3.9.0 / iOS 4.10.0.
+
 ## 4.8.2 — fix 3 pre-existing Kotlin compile errors (first compiling release)
 
 With the wrapper landed (4.8.1) JitPack finally reached the Kotlin compiler and
