@@ -92,6 +92,16 @@ data class DeviceTakeoverEvent(
     val at: Long,
 )
 
+/**
+ * Detail handed to [SendoraCloudAuth.onDeletionCancelled] subscribers (s58.269).
+ * Fires once per sign-in that cancelled a pending self-service account deletion
+ * within its grace window — the account is restored with the SAME user_id.
+ */
+data class DeletionCancelledEvent(
+    val userId: String,
+    val at: Long,
+)
+
 class SendoraCloudAuth internal constructor(
     private val client: ApiClient,
     private val storage: Storage,
@@ -106,6 +116,8 @@ class SendoraCloudAuth internal constructor(
     // callers can unsubscribe via the returned lambda.
     private val takeoverListeners = java.util.concurrent.ConcurrentHashMap<java.util.UUID, (DeviceTakeoverEvent) -> Unit>()
     @Volatile private var lastTakeover: DeviceTakeoverEvent? = null
+    private val deletionCancelledListeners = java.util.concurrent.ConcurrentHashMap<java.util.UUID, (DeletionCancelledEvent) -> Unit>()
+    @Volatile private var lastDeletionCancelled: DeletionCancelledEvent? = null
     // Long-lived coroutine scope for the proactive-refresh cron (s58.73).
     // SupervisorJob so a single tick failure doesn't kill the loop.
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -347,6 +359,29 @@ class SendoraCloudAuth internal constructor(
         )
         lastTakeover = evt
         for (fn in takeoverListeners.values.toList()) {
+            runCatching { fn(evt) }
+        }
+    }
+
+    /**
+     * Subscribe to deletion-cancelled events (s58.269): fires when a sign-in
+     * cancelled a pending self-service account deletion within its grace window
+     * (the account is restored, same user_id). Surface "your deletion was
+     * cancelled" + reconcile local state. Returns an unsubscribe function.
+     */
+    fun onDeletionCancelled(listener: (DeletionCancelledEvent) -> Unit): () -> Unit {
+        val key = java.util.UUID.randomUUID()
+        deletionCancelledListeners[key] = listener
+        return { deletionCancelledListeners.remove(key) }
+    }
+
+    /** The most recent deletion-cancelled event this session, or null. */
+    fun getLastDeletionCancelled(): DeletionCancelledEvent? = lastDeletionCancelled
+
+    internal fun fireDeletionCancelled(identifiedUserId: String) {
+        val evt = DeletionCancelledEvent(userId = identifiedUserId, at = System.currentTimeMillis())
+        lastDeletionCancelled = evt
+        for (fn in deletionCancelledListeners.values.toList()) {
             runCatching { fn(evt) }
         }
     }
@@ -943,6 +978,11 @@ class SendoraCloudAuth internal constructor(
         val retiredAnonUserId = data?.get("retiredAnonUserId") as? String
         if (!retiredAnonUserId.isNullOrEmpty()) {
             fireDeviceTakeover(retiredAnonUserId, user.id)
+        }
+        // s58.269 — fire onDeletionCancelled when this sign-in cancelled a
+        // pending self-deletion within grace (account restored, same user_id).
+        if (data?.get("reactivatedFromDeletion") as? Boolean == true) {
+            fireDeletionCancelled(user.id)
         }
     }
 

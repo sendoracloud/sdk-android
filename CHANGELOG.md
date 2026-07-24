@@ -1,5 +1,16 @@
 # Changelog
 
+## 4.10.0 — onDeletionCancelled (account-restore signal)
+
+New `auth.onDeletionCancelled(listener)` + `auth.getLastDeletionCancelled()` —
+fires when a sign-in **cancelled a pending self-service account deletion** within
+its grace window (account restored, same user_id). Mirrors `onDeviceTakeover`;
+fired from `persist()` reading a new `reactivatedFromDeletion` flag the backend
+now returns on every sign-in response. Show "your deletion was cancelled" +
+reconcile local state. Pairs with the server-side `auth.deletion_cancelled` /
+`auth.deletion_scheduled` webhooks (s58.269). Compiles (`./gradlew
+:publishToMavenLocal` BUILD SUCCESSFUL). Additive, not in the golden contract.
+
 ## 4.9.0 — identity linking on an identified session (ADR-030) + signUp() fix
 
 **New: link a SECOND credential to an already-signed-in account, preserving the

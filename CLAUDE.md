@@ -120,6 +120,17 @@ class MyFcm : FirebaseMessagingService() {
 - Battery Optimization may delay updates on aggressive OEMs (Xiaomi, Huawei). Android lacks Apple-style update budgets.
 - ProgressStyle requires API 34+; older Android uses BigTextStyle.
 
+## 4.10.0 — onDeletionCancelled (account-restore listener, s58.269)
+
+`auth.onDeletionCancelled(listener)` + `getLastDeletionCancelled()` (returns
+`DeletionCancelledEvent`) — mirrors `onDeviceTakeover` (ConcurrentHashMap,
+runCatching). Fired centrally from `persist()` when a sign-in cancelled a pending
+self-service deletion within grace (account restored, same sub) — reads a new
+`reactivatedFromDeletion` boolean off the response. Pairs with backend
+`auth.deletion_cancelled`/`auth.deletion_scheduled` webhooks. BUILD SUCCESSFUL.
+Additive, not in the golden contract. Parity with RN 1.26.0 / web 3.10.0 / iOS
+4.11.0.
+
 ## 4.9.0 — identity linking on an identified session (ADR-030) + signUp() fix
 
 Non-anonymous sibling of ADR-025. New `linkEmailPassword` / `linkSocial` (+
