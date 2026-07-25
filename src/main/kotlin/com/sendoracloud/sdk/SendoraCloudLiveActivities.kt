@@ -154,7 +154,7 @@ class SendoraCloudLiveActivities internal constructor(
         // Permission check is host-app responsibility on API 33+. The
         // try/catch swallows SecurityException for older code paths.
         try {
-            @SuppressWarnings("MissingPermission")
+            @Suppress("MissingPermission")
             mgr.notify(notificationId, buildNotification(contentStateJson))
         } catch (_: SecurityException) {
             return false

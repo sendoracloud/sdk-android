@@ -3,11 +3,13 @@ package com.sendoracloud.sdk
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.SystemClock
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import com.sendoracloud.sdk.internal.*
 import kotlinx.coroutines.*
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -36,9 +38,21 @@ object SendoraCloud {
     private var eventQueue: EventQueue? = null
     private var deviceContext: DeviceContext? = null
     private var fingerprintHash: String? = null
+    private var appContext: Context? = null
     private var currentUserId: String? = null
     private var currentIdentityToken: String? = null
     private var isConfigured = false
+
+    // --- Engagement time (foreground-only, Wave 75) ---
+    // Guarded by the `engLock` monitor. Durations use SystemClock.elapsedRealtime()
+    // (monotonic — immune to wall-clock / NTP jumps).
+    private val engLock = Any()
+    private var engScreen: String? = null
+    private var engAccumMs: Long = 0
+    /** Foreground segment start (elapsedRealtime ms); 0 = paused. */
+    private var engSegmentStart: Long = 0
+    private const val MIN_ENGAGEMENT_MS = 250L        // drop screen flicker
+    private const val MAX_ENGAGEMENT_MS = 6L * 60 * 60 * 1000 // 6h clamp
 
     /** Consent gate. Events queue but do not send until granted. */
     val consent: SendoraCloudConsent = SendoraCloudConsent(false)
@@ -63,6 +77,12 @@ object SendoraCloud {
     var links: SendoraCloudLinks? = null
         private set
 
+    /**
+     * Wave 66 — open the worker-hosted contact widget in a WebView.
+     * Initialised eagerly because the surface has no per-app state.
+     */
+    val support: SendoraCloudSupport = SendoraCloudSupport()
+
     /** Passkeys (WebAuthn via Credential Manager). API 28+ at runtime. */
     val passkeys: SendoraCloudPasskeys?
         get() = auth?.passkeys
@@ -84,6 +104,7 @@ object SendoraCloud {
      */
     fun init(context: Context, apiKey: String, projectId: String? = null, options: SendoraCloudConfig? = null) {
         val appContext = context.applicationContext
+        this.appContext = appContext
         val cfg = options ?: SendoraCloudConfig(apiKey = apiKey, projectId = projectId)
         val finalConfig = cfg.copy(
             apiKey = cfg.apiKey.ifEmpty { apiKey },
@@ -105,6 +126,7 @@ object SendoraCloud {
 
         val store = Storage(appContext)
         storage = store
+        store.ensureSchemaVersion()
         currentUserId = store.cachedUserId
 
         val device = DeviceContext.collect(appContext)
@@ -116,8 +138,11 @@ object SendoraCloud {
 
         val queue = EventQueue(store, finalConfig.flushAt, finalConfig.maxQueueSize)
         queue.setFlushHandler { events ->
-            if (!consent.isGranted) return@setFlushHandler
-            flushEvents(events, client)
+            // Return false → events stay queued (ACK-before-remove). When consent
+            // isn't granted yet, keep them buffered until consent.subscribe()
+            // re-flushes on grant rather than dropping the batch.
+            if (!consent.isGranted) false
+            else flushEvents(events, client)
         }
         queue.startTimer(finalConfig.flushInterval)
         eventQueue = queue
@@ -191,6 +216,9 @@ object SendoraCloud {
         runCatching {
             ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
                 override fun onStop(owner: LifecycleOwner) {
+                    // Flush engagement for the current screen + pause BEFORE
+                    // session-end so it carries the just-ended foreground span.
+                    if (finalConfig.autoTrackEngagement) engFlush()
                     scope.launch {
                         eventQueue?.persistToDisk()
                         trackSessionEnd()
@@ -207,6 +235,7 @@ object SendoraCloud {
                             "sessionId" to (storage?.sessionId ?: "")
                         ))
                     }
+                    if (finalConfig.autoTrackEngagement) engResume()
                 }
             })
         }
@@ -241,6 +270,15 @@ object SendoraCloud {
         return parseDeepLink(uri)
     }
 
+    /**
+     * Legacy / attribution-only deferred-deeplink path: posts to
+     * `/attribution/deferred` using the 16-hex `FingerprintGenerator` hash.
+     * For Branch-parity deferred matching prefer
+     * `SendoraCloud.links?.matchDeferred(...)`, which hits `/sdk/links/match`
+     * with the 64-hex canonical `computeDeviceFingerprint`. The two paths use
+     * DIFFERENT fingerprint recipes and therefore never cross-match — do not
+     * mix them for the same install. Kept for backward compatibility.
+     */
     fun checkDeferredDeepLink(callback: (SendoraCloudLinkData?) -> Unit) {
         val cfg = config
         val store = storage
@@ -293,14 +331,91 @@ object SendoraCloud {
             put("properties", properties ?: emptyMap<String, Any>())
             put("context", mapOf(
                 "device" to (deviceContext?.toMap() ?: emptyMap()),
-                "sdk" to mapOf("name" to "sendora-android", "version" to "4.0.5"),
+                "sdk" to mapOf("name" to SDK_NAME, "version" to SDK_VERSION),
             ))
             put("sessionId", storage?.sessionId ?: "")
+            // Fixed placeholder, not per-purpose granularity. `consent` here
+            // is a single boolean gate (see SendoraCloudConsent); the array is
+            // a constant marker matching the web/iOS SDKs, NOT a list of the
+            // specific purposes the user granted. The backend must not gate
+            // purpose-scoped processing (e.g. marketing vs analytics) on this
+            // value — buffering already happens client-side until consent is
+            // granted. Make SendoraCloudConsent purpose-aware before relying
+            // on this array for anything finer-grained.
             put("consent", listOf("analytics"))
-            currentUserId?.let { put("userId", it) }
+            val uid = currentUserId
+            if (uid != null) {
+                put("userId", uid)
+            } else {
+                // No identified user yet — attach the stable device id as
+                // anonymousId so the backend's coalesce(user_id, anonymous_id)
+                // identity (s58.219) counts this install instead of
+                // undercounting Android anonymous users. Mirrors sdk-ios.
+                storage?.deviceId?.let { put("anonymousId", it) }
+            }
             currentIdentityToken?.let { put("identityToken", it) }
         }
         scope.launch { eventQueue?.add(event) }
+    }
+
+    /**
+     * Record a screen view. Emits `screen.viewed` and (when
+     * `autoTrackEngagement` is on) flushes the foreground engagement time of
+     * the previously-viewed screen as an `app.engagement` event. Call from
+     * your navigation listener / `Activity.onResume` / Compose nav callback.
+     * No Activity/Fragment auto-instrumentation — you name real screens.
+     */
+    fun trackScreen(name: String, properties: Map<String, Any>? = null) {
+        if (!isConfigured) return
+        val cfg = config ?: return
+        if (cfg.autoTrackEngagement) engFlush()
+        val props = (properties ?: emptyMap()) + mapOf("screenName" to name)
+        trackEvent("screen.viewed", props)
+        if (cfg.autoTrackEngagement) engEnter(name)
+    }
+
+    // --- Engagement timer (foreground-only, Wave 75) ---
+
+    /** Bank the in-flight foreground segment, then emit `app.engagement`. */
+    private fun engFlush() {
+        var emitMs = 0L
+        var screen: String? = null
+        synchronized(engLock) {
+            if (engSegmentStart > 0L) {
+                engAccumMs += SystemClock.elapsedRealtime() - engSegmentStart
+                engSegmentStart = 0L
+            }
+            val s = engScreen
+            if (s == null) { engAccumMs = 0L; return@synchronized }
+            var ms = engAccumMs
+            engAccumMs = 0L
+            if (ms < MIN_ENGAGEMENT_MS) return@synchronized
+            if (ms > MAX_ENGAGEMENT_MS) ms = MAX_ENGAGEMENT_MS
+            emitMs = ms
+            screen = s
+        }
+        val s = screen ?: return
+        trackEvent("app.engagement", mapOf(
+            "durationMs" to emitMs,
+            "screen" to s,
+            "sessionId" to (storage?.sessionId ?: ""),
+        ))
+    }
+
+    private fun engEnter(name: String) {
+        synchronized(engLock) {
+            engScreen = name
+            engAccumMs = 0L
+            engSegmentStart = SystemClock.elapsedRealtime()
+        }
+    }
+
+    private fun engResume() {
+        synchronized(engLock) {
+            if (engScreen != null && engSegmentStart == 0L) {
+                engSegmentStart = SystemClock.elapsedRealtime()
+            }
+        }
     }
 
     fun identify(userId: String, traits: Map<String, Any>? = null, options: SendoraCloudIdentifyOptions? = null) {
@@ -362,7 +477,8 @@ object SendoraCloud {
         val client = apiClient ?: return
         val cfg = config ?: return
         store.isFirstLaunch = false
-        val body = mapOf<String, Any?>(
+
+        val baseBody = mutableMapOf<String, Any?>(
             "projectId" to cfg.projectId,
             "deviceId" to store.deviceId,
             "fingerprintHash" to (fingerprintHash ?: ""),
@@ -370,7 +486,30 @@ object SendoraCloud {
             "os" to "Android",
             "osVersion" to (deviceContext?.osVersion ?: ""),
         )
-        client.post("/attribution/install", body)
+
+        // Wave 51 — Play Install Referrer. When host app has the
+        // `com.android.installreferrer:installreferrer` dep AND Play
+        // Store delivered a referrer, route through
+        // /attribution/install-referrer which runs deterministic match
+        // on parsed sendora_link_id / gclid / fbclid / ttclid / utm_*
+        // BEFORE falling back to fingerprint/IP. Otherwise the standard
+        // /attribution/install path runs as before. Either path records
+        // an install row exactly once.
+        val ctx = appContext
+        if (ctx != null && PlayInstallReferrer.isAvailable()) {
+            val ref = PlayInstallReferrer.fetch(ctx)
+            if (ref != null && ref.referrer.isNotEmpty()) {
+                val body = baseBody + mapOf(
+                    "referrer" to ref.referrer,
+                    "referrerClickAtMs" to ref.referrerClickAtMs,
+                    "installBeginAtMs" to ref.installBeginAtMs,
+                    "googlePlayInstant" to ref.googlePlayInstant,
+                )
+                client.post("/attribution/install-referrer", body)
+                return
+            }
+        }
+        client.post("/attribution/install", baseBody)
     }
 
     private fun trackSessionStart() {
@@ -383,11 +522,19 @@ object SendoraCloud {
         trackEvent("session.ended", mapOf("sessionId" to (storage?.sessionId ?: "")))
     }
 
-    private fun flushEvents(events: List<Map<String, Any?>>, client: ApiClient) {
-        if (events.isEmpty()) return
-        scope.launch {
-            if (events.size == 1) client.post("/events", events.first())
-            else client.postBatch("/events/batch", events)
+    /**
+     * Send a batch and report whether the backend ACCEPTED it. The EventQueue
+     * only removes the events once this returns true (ACK-before-remove,
+     * ADR-023 §7) — a network error / 5xx returns false and the batch stays
+     * queued for the next flush instead of being silently dropped.
+     */
+    private suspend fun flushEvents(events: List<Map<String, Any?>>, client: ApiClient): Boolean {
+        if (events.isEmpty()) return true
+        return if (events.size == 1) {
+            val response = client.post("/events", events.first())
+            (response?.get("success") as? Boolean) == true
+        } else {
+            client.postBatch("/events/batch", events)
         }
     }
 }

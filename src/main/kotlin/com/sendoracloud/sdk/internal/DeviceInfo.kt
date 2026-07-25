@@ -21,6 +21,9 @@ internal data class DeviceContext(
         "os" to os,
         "osVersion" to osVersion,
         "model" to model,
+        // ADR-022: app version (PackageManager versionName) so the dashboard
+        // can break analytics down by release.
+        "appVersion" to appVersion,
     )
 
     companion object {

@@ -37,6 +37,14 @@ dependencies {
     // Host app must also include this; declared `compileOnly` so SDK doesn't
     // force-pull a Google Play dependency on customers that don't need geofences.
     compileOnly("com.google.android.gms:play-services-location:21.3.0")
+    // Play Install Referrer (Wave 51) — surfaces the URL-encoded referrer
+    // string Play Store attached to the install. Used by reportInstallIfNeeded
+    // to call /attribution/install-referrer for deterministic attribution
+    // (utm / gclid / fbclid / ttclid / sendora_link_id) when the referrer is
+    // available. `compileOnly` so the dep is opt-in — host app adds it when
+    // they want install-referrer support; SDK falls back to /attribution/install
+    // otherwise.
+    compileOnly("com.android.installreferrer:installreferrer:2.2")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
 }
@@ -48,7 +56,8 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.sendoracloud"
                 artifactId = "sdk-android"
-                version = "4.0.4"
+                // Keep in lockstep with internal/SdkVersion.kt SDK_VERSION (ADR-023 §7).
+                version = "4.11.0"
                 pom {
                     name.set("Sendora Cloud Android SDK")
                     description.set("Deep linking, attribution, and event tracking for Android.")

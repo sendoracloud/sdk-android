@@ -54,6 +54,20 @@ internal class Storage(context: Context) {
      *  surface a configuration error to the consumer if false. */
     val isSecureAvailable: Boolean get() = securePrefs != null
 
+    /**
+     * On-device schema/format-version marker (ADR-023 §5). Non-sensitive →
+     * plain SharedPreferences (NOT EncryptedSharedPreferences). Written once
+     * at init while the format is still v1, so a future SDK can branch a
+     * read-old→write-new migration on it (`if (stored < N) migrate()`)
+     * instead of guessing. New key — read nowhere yet; never rename existing
+     * keys (frozen per ADR-023 §3.4).
+     */
+    fun ensureSchemaVersion() {
+        if (!prefs.contains("schema_version")) {
+            prefs.edit().putString("schema_version", "1").apply()
+        }
+    }
+
     var isFirstLaunch: Boolean
         get() = !prefs.getBoolean("launched", false)
         set(value) { prefs.edit().putBoolean("launched", !value).apply() }
@@ -81,15 +95,28 @@ internal class Storage(context: Context) {
             e.apply()
         }
 
+    /**
+     * Process-lifetime fallback id, minted at most once when secure storage
+     * is unavailable. Cached so every caller in the same process sees ONE id
+     * (otherwise each getter returned a fresh UUID, fanning a single install
+     * out to multiple device ids across attribution/deferred reports and
+     * breaking backend dedup). Guarded by `_sessionLock`.
+     */
+    private var ephemeralDeviceId: String? = null
+
     val deviceId: String
         get() = synchronized(_sessionLock) {
             val sp = securePrefs
             if (sp == null) {
-                // Cannot persist — return a per-process random id so
-                // events still have a stable id within the process,
-                // but log loudly so the developer notices.
+                // Cannot persist — return a per-process random id so events
+                // still have a STABLE id within the process. Cache it so all
+                // callers agree; log loudly the first time so the developer
+                // notices.
+                ephemeralDeviceId?.let { return it }
                 SendoraCloudLogger.error("deviceId requested but secure storage unavailable; returning ephemeral id")
-                return UUID.randomUUID().toString()
+                val ephemeral = UUID.randomUUID().toString()
+                ephemeralDeviceId = ephemeral
+                return ephemeral
             }
             val existing = sp.getString("device_id", null)
             if (existing != null) return existing
@@ -99,7 +126,10 @@ internal class Storage(context: Context) {
         }
 
     fun regenerateDeviceId() {
-        securePrefs?.edit()?.remove("device_id")?.apply()
+        synchronized(_sessionLock) {
+            ephemeralDeviceId = null
+            securePrefs?.edit()?.remove("device_id")?.apply()
+        }
     }
 
     // --- Auth Service tokens (EncryptedSharedPreferences ONLY) ---

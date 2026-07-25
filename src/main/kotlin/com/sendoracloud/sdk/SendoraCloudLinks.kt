@@ -67,6 +67,15 @@ class SendoraCloudLinks internal constructor(
         val title: String,
         /** **Optional as of 3.8.0** — backend defaults from your project's apps registry. */
         val fallbackUrl: String? = null,
+        /**
+         * How a **mobile visitor without the app installed** is routed
+         * (Adjust / Branch parity). `"auto"` (default) opens the app store
+         * when one is registered for the platform, else the web [fallbackUrl];
+         * `"store"` prefers the store; `"web"` forces the web [fallbackUrl]
+         * even when a store URL exists. `null` inherits the project default.
+         * Desktop is always web.
+         */
+        val noAppMode: String? = null,
         val iosDeepLinkPath: String? = null,
         val androidDeepLinkPath: String? = null,
         val linkData: Map<String, Any>? = null,
@@ -155,6 +164,15 @@ class SendoraCloudLinks internal constructor(
     private val prewarmTtlMs = 5 * 60 * 1000L
     private val prewarmMax = 50
 
+    /**
+     * Wave 28 — concurrent-mint cap. A runaway loop calling `prewarm()`
+     * (eg in a Compose LazyColumn item composable) would otherwise burn
+     * through the backend's per-key rate limit + customer's plan quota.
+     * 5 inflight matches real share-row UIs.
+     */
+    private var prewarmInflight = 0
+    private val prewarmMaxInflight = 5
+
     private fun cacheKey(input: LinkCreateInput, override: String?): String {
         if (override != null) return "k:$override"
         val body = buildCreateBody(input)
@@ -187,6 +205,7 @@ class SendoraCloudLinks internal constructor(
     private fun buildCreateBody(input: LinkCreateInput): Map<String, Any?> = buildMap {
         put("title", input.title)
         input.fallbackUrl?.let { put("fallbackUrl", it) }
+        input.noAppMode?.let { put("noAppMode", it) }
         input.iosDeepLinkPath?.let { put("iosDeepLinkPath", it) }
         input.androidDeepLinkPath?.let { put("androidDeepLinkPath", it) }
         input.linkData?.let { put("linkData", it) }
@@ -203,18 +222,31 @@ class SendoraCloudLinks internal constructor(
         (input.androidPackageName ?: packageName)?.let { put("androidPackageName", it) }
     }
 
-    /** Background-mint + cache. Fire-and-forget. */
+    /**
+     * Background-mint + cache. Fire-and-forget.
+     *
+     * Wave 28 — silently drops the call when more than
+     * [prewarmMaxInflight] mints are already in flight. Prewarm is
+     * fire-and-forget by contract; an overflow `prewarm()` is fine to
+     * skip because the next matching `create()` will do the mint
+     * inline. Caps unbounded fan-out from runaway loops.
+     */
     fun prewarm(input: LinkCreateInput, key: String? = null) {
         if (input.title.isEmpty()) return
         scope.launch {
             val ck = cacheKey(input, key)
             evictExpired()
-            cacheMutex.withLock {
-                if (prewarmCache.containsKey(ck)) return@launch
+            val shouldRun = cacheMutex.withLock {
+                if (prewarmCache.containsKey(ck)) return@withLock false
+                if (prewarmInflight >= prewarmMaxInflight) return@withLock false
+                prewarmInflight++
                 prewarmCache[ck] = PrewarmEntry()
+                true
             }
+            if (!shouldRun) return@launch
             val result = doCreate(input)
             val waiters = cacheMutex.withLock {
+                prewarmInflight--
                 val e = prewarmCache[ck]
                 if (e != null) {
                     if (result.isFailure) {
@@ -248,7 +280,11 @@ class SendoraCloudLinks internal constructor(
                     prewarmCache.remove(ck) // single-use
                     Pair(e, false)
                 } else if (e != null) {
-                    e.waiters.add { withContext(Dispatchers.Main) { onResult(it) } }
+                    // waiters is a plain (non-suspend) (Result) -> Unit, invoked
+                    // via forEach{} in the prewarm-completion coroutine — so it
+                    // can't call the suspend `withContext`. Hop to Main with a
+                    // (non-suspend) launch on the same scope instead.
+                    e.waiters.add { r -> scope.launch(Dispatchers.Main) { onResult(r) } }
                     Pair(e, true)
                 } else Pair(null, false)
             }

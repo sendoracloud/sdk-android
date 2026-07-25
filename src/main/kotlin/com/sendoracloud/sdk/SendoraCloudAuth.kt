@@ -50,10 +50,28 @@ data class SendoraCloudAuthUser(
     val emailVerified: Boolean,
     val name: String?,
     val isAnonymous: Boolean,
+    /**
+     * How this account was FIRST created (`signupMethod`, immutable) and how it
+     * MOST RECENTLY authenticated (`lastLoginMethod`). Free-form provider tokens
+     * (`password`/`anonymous`/`google`/`apple`/`gamecenter`/`playgames`/
+     * `magic_link`/`passkey`/`oidc`/…). Read-only, display-only — never an
+     * authorization signal. `null` against a backend older than s58.266, or for a
+     * row created before it (backfilled on next sign-in). Defaulted so cached
+     * users from a pre-4.8.0 build still construct. sdk-android 4.8.0+.
+     */
+    val signupMethod: String? = null,
+    val lastLoginMethod: String? = null,
 )
 
 sealed class SendoraCloudAuthError(message: String) : Throwable(message) {
     class EmailAlreadyTaken(message: String) : SendoraCloudAuthError(message)
+    /** `signUp()` on a session already signed in with an identity (ADR-030 §4).
+     *  Use `linkEmailPassword()` / `linkGoogle()` / … to add a credential to THIS
+     *  account, or sign out first — do not create a second account. */
+    class AlreadyIdentified(message: String) : SendoraCloudAuthError(message)
+    /** A credential passed to `link*()` is already attached to a DIFFERENT
+     *  account (ADR-030 §2). Sendora never auto-merges two real accounts. */
+    class CredentialInUse(message: String) : SendoraCloudAuthError(message)
     class Unauthorized(message: String) : SendoraCloudAuthError(message)
     class Network(message: String) : SendoraCloudAuthError(message)
     class SecureStorageUnavailable(message: String) : SendoraCloudAuthError(message)
@@ -74,6 +92,16 @@ data class DeviceTakeoverEvent(
     val at: Long,
 )
 
+/**
+ * Detail handed to [SendoraCloudAuth.onDeletionCancelled] subscribers (s58.269).
+ * Fires once per sign-in that cancelled a pending self-service account deletion
+ * within its grace window — the account is restored with the SAME user_id.
+ */
+data class DeletionCancelledEvent(
+    val userId: String,
+    val at: Long,
+)
+
 class SendoraCloudAuth internal constructor(
     private val client: ApiClient,
     private val storage: Storage,
@@ -88,6 +116,8 @@ class SendoraCloudAuth internal constructor(
     // callers can unsubscribe via the returned lambda.
     private val takeoverListeners = java.util.concurrent.ConcurrentHashMap<java.util.UUID, (DeviceTakeoverEvent) -> Unit>()
     @Volatile private var lastTakeover: DeviceTakeoverEvent? = null
+    private val deletionCancelledListeners = java.util.concurrent.ConcurrentHashMap<java.util.UUID, (DeletionCancelledEvent) -> Unit>()
+    @Volatile private var lastDeletionCancelled: DeletionCancelledEvent? = null
     // Long-lived coroutine scope for the proactive-refresh cron (s58.73).
     // SupervisorJob so a single tick failure doesn't kill the loop.
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -108,6 +138,8 @@ class SendoraCloudAuth internal constructor(
                         emailVerified = obj.optBoolean("emailVerified", false),
                         name = obj.opt("name")?.takeIf { it != JSONObject.NULL } as? String,
                         isAnonymous = obj.optBoolean("isAnonymous", false),
+                        signupMethod = obj.opt("signupMethod")?.takeIf { it != JSONObject.NULL } as? String, // s58.266
+                        lastLoginMethod = obj.opt("lastLoginMethod")?.takeIf { it != JSONObject.NULL } as? String,
                     )
                     cachedExpiresAt = storage.authAccessExpiresAt
                     cachedUser?.let { onIdentityChange(it.id) }
@@ -184,11 +216,14 @@ class SendoraCloudAuth internal constructor(
             name?.let { body["name"] = it }
             return@withLock callAuth("/auth-service/upgrade", body)
         }
-        // Non-anonymous identified state — wipe BEFORE the network call
-        // so any track() during the auth round-trip can't attach to
-        // the prior identity.
+        // ADR-030 §4: already signed in with an identity. signUp() would orphan
+        // the current account by minting a second one — refuse and point at
+        // link*() (was: silently wiped + fresh-signup = duplicate account). A
+        // genuinely signed-out caller (no cachedUser) still falls through.
         if (cachedUser != null && cachedUser?.isAnonymous == false) {
-            wipeLocalIdentity()
+            return@withLock Result.failure(SendoraCloudAuthError.AlreadyIdentified(
+                "Already signed in. Use linkEmailPassword() to add a password to this account, or sign out first."
+            ))
         }
         val body = mutableMapOf<String, Any?>("email" to email, "password" to password)
         name?.let { body["name"] = it }
@@ -328,6 +363,29 @@ class SendoraCloudAuth internal constructor(
         }
     }
 
+    /**
+     * Subscribe to deletion-cancelled events (s58.269): fires when a sign-in
+     * cancelled a pending self-service account deletion within its grace window
+     * (the account is restored, same user_id). Surface "your deletion was
+     * cancelled" + reconcile local state. Returns an unsubscribe function.
+     */
+    fun onDeletionCancelled(listener: (DeletionCancelledEvent) -> Unit): () -> Unit {
+        val key = java.util.UUID.randomUUID()
+        deletionCancelledListeners[key] = listener
+        return { deletionCancelledListeners.remove(key) }
+    }
+
+    /** The most recent deletion-cancelled event this session, or null. */
+    fun getLastDeletionCancelled(): DeletionCancelledEvent? = lastDeletionCancelled
+
+    internal fun fireDeletionCancelled(identifiedUserId: String) {
+        val evt = DeletionCancelledEvent(userId = identifiedUserId, at = System.currentTimeMillis())
+        lastDeletionCancelled = evt
+        for (fn in deletionCancelledListeners.values.toList()) {
+            runCatching { fn(evt) }
+        }
+    }
+
     /** Exchange the MFA challenge token + TOTP/recovery code for a session. */
     suspend fun challengeMfa(challengeToken: String, code: String): Result<SendoraCloudAuthUser> = mutex.withLock {
         val body = mutableMapOf<String, Any>("challengeToken" to challengeToken, "code" to code)
@@ -366,6 +424,11 @@ class SendoraCloudAuth internal constructor(
         codeVerifier: String? = null,
         appleFirstName: String? = null,
         appleLastName: String? = null,
+        // ADR-025 link-in-place opt-in. When anonymous + `link = true`, an
+        // anon→social upgrade KEEPS the same user id (sub) — promoted in place
+        // (like Firebase linkWithCredential) instead of a device-takeover that
+        // mints a new id. No effect off-anon or on a collision.
+        link: Boolean = false,
     ): Result<SendoraCloudAuthUser> = mutex.withLock {
         if (!storage.isSecureAvailable) {
             return@withLock Result.failure(SendoraCloudAuthError.SecureStorageUnavailable("EncryptedSharedPreferences unavailable"))
@@ -388,26 +451,56 @@ class SendoraCloudAuth internal constructor(
                 })
             }
             prevAnonRefreshToken?.let { put("prevAnonRefreshToken", it) }
+            // ADR-025: opt into link-in-place (backend ignores it unless anon + new identity).
+            if (link) put("linkAnonymous", true)
         }
         callAuth("/auth-service/login/social", body)
     }
 
-    suspend fun signInWithGoogle(code: String, redirectUri: String) =
-        loginSocial(provider = "google", code = code, redirectUri = redirectUri)
+    suspend fun signInWithGoogle(code: String, redirectUri: String, link: Boolean = false) =
+        loginSocial(provider = "google", code = code, redirectUri = redirectUri, link = link)
+
+    /**
+     * Google Play Games sign-in (email-less, player-keyed). Pass the
+     * serverAuthCode from
+     * `PlayGames.getGamesSignInClient(activity).requestServerSideAccess(webClientId, false)`
+     * — obtain it via the Play Games SDK (or the Sendora helper). `link = true`
+     * KEEPS the same user id when upgrading an anonymous device (ADR-025
+     * link-in-place); no effect off-anon or on a collision.
+     */
+    suspend fun signInWithPlayGames(serverAuthCode: String, link: Boolean = false): Result<SendoraCloudAuthUser> = mutex.withLock {
+        if (!storage.isSecureAvailable) {
+            return@withLock Result.failure(SendoraCloudAuthError.SecureStorageUnavailable("EncryptedSharedPreferences unavailable"))
+        }
+        // Device-takeover hint — same posture as loginSocial().
+        val prevAnonRefreshToken: String? = if (cachedUser?.isAnonymous == true) storage.authRefreshToken else null
+
+        if (cachedUser != null) wipeLocalIdentity()
+
+        val body = buildMap<String, Any> {
+            put("serverAuthCode", serverAuthCode)
+            prevAnonRefreshToken?.let { put("prevAnonRefreshToken", it) }
+            // ADR-025: opt into link-in-place (backend ignores it unless anon + new identity).
+            if (link) put("linkAnonymous", true)
+        }
+        callAuth("/auth-service/login/play-games", body)
+    }
 
     suspend fun signInWithGitHub(code: String, redirectUri: String) =
         loginSocial(provider = "github", code = code, redirectUri = redirectUri)
 
-    /** Apple Sign In. Pass `idToken` from the native flow + name fields on first sign-in. */
+    /** Apple Sign In. Pass `idToken` from the native flow + name fields on first sign-in. `link` = ADR-025 keep-the-sub on an anon upgrade. */
     suspend fun signInWithApple(
         idToken: String,
         firstName: String? = null,
         lastName: String? = null,
+        link: Boolean = false,
     ) = loginSocial(
         provider = "apple",
         idToken = idToken,
         appleFirstName = firstName,
         appleLastName = lastName,
+        link = link,
     )
 
     suspend fun signInWithMicrosoft(code: String, redirectUri: String) =
@@ -551,6 +644,192 @@ class SendoraCloudAuth internal constructor(
         client.delete("/auth-service/sessions/me", headers)
     }
 
+    /**
+     * Outcome of [deleteAccount]. [status] is `"purged"` (hard-deleted now,
+     * grace = 0) or `"pending"` (deactivated + sessions revoked now, hard
+     * delete scheduled at [scheduledPurgeAt]; cancellable by signing back in).
+     */
+    data class AccountDeletionResult(
+        val status: String,
+        val scheduledPurgeAt: String?,
+        val graceDays: Int,
+    )
+
+    /**
+     * Delete the signed-in user's account (Apple App Store Guideline 5.1.1(v)).
+     * Honors the project's configured grace period; wipes local identity on
+     * success (the server has revoked the session). Fails when no user is
+     * signed in or the request errors.
+     *
+     * Resolves a FRESH access token via [getAccessToken] first (refreshing a
+     * past-expiry cached token) — this is a one-shot destructive action, so a
+     * 401 from a stale token would silently strand the user with an undeleted
+     * account (the cause of the prod 401s when "delete" was tapped after the
+     * app sat idle). [getAccessToken] uses a separate `refreshMutex`, so calling
+     * it while holding `mutex` here does not deadlock.
+     */
+    suspend fun deleteAccount(): Result<AccountDeletionResult> = mutex.withLock {
+        val token = getAccessToken()
+            ?: return@withLock Result.failure(SendoraCloudAuthError.Unauthorized("Not signed in"))
+        val headers = mapOf("Authorization" to "Bearer $token")
+        val res = client.delete("/auth-service/me", headers)
+            ?: return@withLock Result.failure(SendoraCloudAuthError.Network("deleteAccount failed (network error)"))
+        @Suppress("UNCHECKED_CAST")
+        val data = res["data"] as? Map<String, Any?>
+        if (data == null && res["error"] != null) {
+            @Suppress("UNCHECKED_CAST")
+            val msg = (res["error"] as? Map<String, Any?>)?.get("message") as? String ?: "deleteAccount failed"
+            return@withLock Result.failure(SendoraCloudAuthError.Network(msg))
+        }
+        // Account is gone / deactivated server-side — drop local identity.
+        wipeLocalIdentity()
+        Result.success(AccountDeletionResult(
+            status = data?.get("status") as? String ?: "pending",
+            scheduledPurgeAt = data?.get("scheduledPurgeAt") as? String,
+            graceDays = (data?.get("graceDays") as? Number)?.toInt() ?: 0,
+        ))
+    }
+
+    // --- Identity linking (ADR-030) ---
+    //
+    // Attach a SECOND credential to the CURRENT signed-in account, preserving the
+    // same user id (sub). Unlike signUp()/loginSocial(link) — which preserve the
+    // sub only from an ANONYMOUS session — these operate on an already-identified
+    // account. Bearer-authenticated; NO token rotation (the cached user is
+    // refreshed in place). Collision -> [SendoraCloudAuthError.CredentialInUse]
+    // (never merges). Primary use: one account across platforms — a Play Games
+    // player links email/Google, then signs in on iOS to the SAME sub.
+
+    /** Link email + password to the current account (sub preserved). */
+    suspend fun linkEmailPassword(email: String, password: String): Result<SendoraCloudAuthUser> =
+        linkCredential("/auth-service/me/link/email", mapOf("email" to email, "password" to password))
+
+    /** Link an OAuth social identity. Pass a native `idToken` OR a web `code` + `redirectUri`. */
+    suspend fun linkSocial(
+        provider: String,
+        idToken: String? = null,
+        code: String? = null,
+        redirectUri: String? = null,
+    ): Result<SendoraCloudAuthUser> {
+        val body = mutableMapOf<String, Any?>("provider" to provider)
+        idToken?.let { body["idToken"] = it }
+        code?.let { body["code"] = it }
+        redirectUri?.let { body["redirectUri"] = it }
+        return linkCredential("/auth-service/me/link/social", body)
+    }
+
+    /** Convenience: link a Google identity (native `idToken`, or web `code`+`redirectUri`). */
+    suspend fun linkGoogle(idToken: String? = null, code: String? = null, redirectUri: String? = null): Result<SendoraCloudAuthUser> =
+        linkSocial("google", idToken, code, redirectUri)
+
+    /** Convenience: link an Apple identity. */
+    suspend fun linkApple(idToken: String? = null, code: String? = null, redirectUri: String? = null): Result<SendoraCloudAuthUser> =
+        linkSocial("apple", idToken, code, redirectUri)
+
+    /** Link a Google Play Games identity to the current account. Pass the
+     *  `serverAuthCode` from `requestServerSideAccess` (same input as
+     *  [signInWithPlayGames]). */
+    suspend fun linkPlayGames(serverAuthCode: String): Result<SendoraCloudAuthUser> =
+        linkCredential("/auth-service/me/link/play-games", mapOf("serverAuthCode" to serverAuthCode))
+
+    /** One credential linked to an account (ADR-030 read side, s58.270). */
+    data class LinkedIdentity(
+        val provider: String,
+        val email: String?,
+        val linkedAt: String,
+    )
+
+    /** Result of [listLinkedIdentities] — the full connected-account set. */
+    data class LinkedIdentitiesResult(
+        val identities: List<LinkedIdentity>,
+        val hasPassword: Boolean,
+    )
+
+    /**
+     * List the auth methods/identities linked to the current account (ADR-030
+     * read side, s58.270): every social/gaming identity plus a [hasPassword]
+     * flag — the cross-device / reinstall-durable source of truth for a
+     * "Connected: Play Games · Google" UI (an on-device tracker misses a link
+     * made on another device). Bearer-authenticated network read that resolves a
+     * fresh access token first (mirrors [deleteAccount]; [getAccessToken] uses a
+     * separate refreshMutex, so calling it while holding `mutex` is safe).
+     * Firebase `user.providerData` / Supabase `user.identities` parity.
+     */
+    suspend fun listLinkedIdentities(): Result<LinkedIdentitiesResult> = mutex.withLock {
+        val token = getAccessToken()
+            ?: return@withLock Result.failure(SendoraCloudAuthError.Unauthorized("Sign in before listing linked identities"))
+        val headers = mapOf("Authorization" to "Bearer $token")
+        val response = client.get("/auth-service/me/identities", headers)
+            ?: return@withLock Result.failure(SendoraCloudAuthError.Network("listLinkedIdentities failed (network error)"))
+        val err = parseError(response)
+        if (err != null) return@withLock Result.failure(err)
+        @Suppress("UNCHECKED_CAST")
+        val data = response["data"] as? Map<String, Any?>
+            ?: return@withLock Result.failure(SendoraCloudAuthError.Unknown("Malformed identities response"))
+        @Suppress("UNCHECKED_CAST")
+        val rows = data["identities"] as? List<Map<String, Any?>> ?: emptyList()
+        val identities = rows.mapNotNull { row ->
+            val provider = row["provider"] as? String ?: return@mapNotNull null
+            if (provider.isEmpty()) return@mapNotNull null
+            val linkedAt = row["linkedAt"] as? String ?: return@mapNotNull null
+            LinkedIdentity(provider = provider, email = row["email"] as? String, linkedAt = linkedAt)
+        }
+        val hasPassword = data["hasPassword"] as? Boolean ?: false
+        Result.success(LinkedIdentitiesResult(identities = identities, hasPassword = hasPassword))
+    }
+
+    /** Shared link executor. Resolves a fresh access token, POSTs the credential
+     *  with the Bearer header, then refreshes the cached user IN PLACE (no token
+     *  rotation — the sub is unchanged). Mirrors [deleteAccount]'s Bearer flow;
+     *  [getAccessToken] uses a separate refreshMutex, so calling it while holding
+     *  `mutex` here does not deadlock. */
+    private suspend fun linkCredential(path: String, body: Map<String, Any?>): Result<SendoraCloudAuthUser> = mutex.withLock {
+        val token = getAccessToken()
+            ?: return@withLock Result.failure(SendoraCloudAuthError.Unauthorized("Sign in before linking a credential"))
+        val headers = mapOf("Authorization" to "Bearer $token")
+        val response = client.post(path, body, headers)
+        val err = parseError(response)
+        if (err != null) return@withLock Result.failure(err)
+        val user = parseLinkedUser(response)
+            ?: return@withLock Result.failure(SendoraCloudAuthError.Unknown("Malformed link response"))
+        updateLocalUser(user)
+        Result.success(user)
+    }
+
+    /** Parse the user off a link response (which carries NO tokens, so
+     *  [parseSuccess] — which requires tokens — can't be used). */
+    @Suppress("UNCHECKED_CAST")
+    private fun parseLinkedUser(response: Map<String, Any?>?): SendoraCloudAuthUser? {
+        val data = response?.get("data") as? Map<String, Any?> ?: return null
+        val userMap = data["user"] as? Map<String, Any?> ?: return null
+        val id = userMap["id"] as? String
+        if (id.isNullOrEmpty()) return null
+        return SendoraCloudAuthUser(
+            id = id,
+            email = userMap["email"] as? String,
+            emailVerified = userMap["emailVerified"] as? Boolean ?: false,
+            name = userMap["name"] as? String,
+            isAnonymous = userMap["isAnonymous"] as? Boolean ?: false,
+            signupMethod = userMap["signupMethod"] as? String,
+            lastLoginMethod = userMap["lastLoginMethod"] as? String,
+        )
+    }
+
+    /** Refresh the cached user after a link — the sub is unchanged, so only the
+     *  user object + its stored copy change (no token/identity rotation). */
+    private fun updateLocalUser(user: SendoraCloudAuthUser) {
+        cachedUser = user
+        storage.authUserJson = JSONObject().apply {
+            put("id", user.id)
+            put("email", user.email ?: JSONObject.NULL)
+            put("emailVerified", user.emailVerified)
+            put("name", user.name ?: JSONObject.NULL)
+            put("isAnonymous", user.isAnonymous)
+            put("signupMethod", user.signupMethod ?: JSONObject.NULL)
+            put("lastLoginMethod", user.lastLoginMethod ?: JSONObject.NULL)
+        }.toString()
+    }
+
     private fun bearerHeaders(): Map<String, String>? {
         val token = storage.authAccessToken ?: return null
         return mapOf("Authorization" to "Bearer $token")
@@ -665,6 +944,8 @@ class SendoraCloudAuth internal constructor(
         val code = error?.get("code") as? String ?: ""
         val message = error?.get("message") as? String ?: "Auth request failed"
         return when (code) {
+            "NOT_ANONYMOUS" -> SendoraCloudAuthError.AlreadyIdentified(message)
+            "CREDENTIAL_IN_USE" -> SendoraCloudAuthError.CredentialInUse(message)
             "CONFLICT", "EMAIL_ALREADY_TAKEN" -> SendoraCloudAuthError.EmailAlreadyTaken(message)
             "UNAUTHORIZED" -> SendoraCloudAuthError.Unauthorized(message)
             else -> SendoraCloudAuthError.Unknown("$code: $message")
@@ -688,6 +969,8 @@ class SendoraCloudAuth internal constructor(
             emailVerified = userMap["emailVerified"] as? Boolean ?: false,
             name = userMap["name"] as? String,
             isAnonymous = userMap["isAnonymous"] as? Boolean ?: false,
+            signupMethod = userMap["signupMethod"] as? String,   // s58.266
+            lastLoginMethod = userMap["lastLoginMethod"] as? String,
         )
         return user to tokensMap
     }
@@ -725,6 +1008,8 @@ class SendoraCloudAuth internal constructor(
             put("emailVerified", user.emailVerified)
             put("name", user.name ?: JSONObject.NULL)
             put("isAnonymous", user.isAnonymous)
+            put("signupMethod", user.signupMethod ?: JSONObject.NULL) // s58.266
+            put("lastLoginMethod", user.lastLoginMethod ?: JSONObject.NULL)
         }.toString()
         storage.authUserJson = userJson
         onIdentityChange(user.id)
@@ -739,6 +1024,11 @@ class SendoraCloudAuth internal constructor(
         val retiredAnonUserId = data?.get("retiredAnonUserId") as? String
         if (!retiredAnonUserId.isNullOrEmpty()) {
             fireDeviceTakeover(retiredAnonUserId, user.id)
+        }
+        // s58.269 — fire onDeletionCancelled when this sign-in cancelled a
+        // pending self-deletion within grace (account restored, same user_id).
+        if (data?.get("reactivatedFromDeletion") as? Boolean == true) {
+            fireDeletionCancelled(user.id)
         }
     }
 
