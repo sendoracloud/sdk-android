@@ -45,8 +45,12 @@ import org.json.JSONObject
 class SendoraCloudPasskeys internal constructor(
     private val client: ApiClient,
     private val storage: Storage,
+    /**
+     * Validates the minted session, replaces any prior local identity and
+     * persists — in that order, so an assertion that never completes leaves the
+     * caller signed in as whoever they were. Injected by SendoraCloud.
+     */
     private val installSession: suspend (Map<String, Any?>) -> SendoraCloudAuthUser?,
-    private val wipe: suspend () -> Unit,
     /**
      * Returns the stored anon refresh token iff the local subject is
      * currently anonymous (device-takeover, s58.112). Injected by
@@ -54,13 +58,25 @@ class SendoraCloudPasskeys internal constructor(
      */
     private val takeoverHintProvider: () -> String? = { null },
 ) {
-    sealed class PasskeyError(message: String) : Throwable(message) {
-        class PlatformUnsupported(message: String) : PasskeyError(message)
-        class UserCancelled(message: String) : PasskeyError(message)
-        class CredentialManagerFailed(message: String) : PasskeyError(message)
-        class Network(message: String) : PasskeyError(message)
-        class Unauthorized(message: String) : PasskeyError(message)
-        class Unknown(message: String) : PasskeyError(message)
+    /**
+     * [kind] mirrors [SendoraCloudAuthErrorKind] (4.12.0) so a caller can branch
+     * on one taxonomy across every sign-in path — a dismissed system sheet
+     * classifies as CANCELLED here exactly as a cancelled Play Games sheet does
+     * on the auth surface. The error CLASSES are unchanged.
+     */
+    sealed class PasskeyError(
+        message: String,
+        val kind: SendoraCloudAuthErrorKind,
+    ) : Throwable(message) {
+        /** True when retrying the SAME input can plausibly succeed later. */
+        val retryable: Boolean get() = kind.retryable
+
+        class PlatformUnsupported(message: String) : PasskeyError(message, SendoraCloudAuthErrorKind.CONFIG)
+        class UserCancelled(message: String) : PasskeyError(message, SendoraCloudAuthErrorKind.CANCELLED)
+        class CredentialManagerFailed(message: String) : PasskeyError(message, SendoraCloudAuthErrorKind.UNKNOWN)
+        class Network(message: String) : PasskeyError(message, SendoraCloudAuthErrorKind.NETWORK)
+        class Unauthorized(message: String) : PasskeyError(message, SendoraCloudAuthErrorKind.INVALID_CREDENTIAL)
+        class Unknown(message: String) : PasskeyError(message, SendoraCloudAuthErrorKind.UNKNOWN)
     }
 
     /**
@@ -147,12 +163,12 @@ class SendoraCloudPasskeys internal constructor(
             ?: return Result.failure(PasskeyError.Unknown("Malformed authenticate/start response"))
         val requestJson = JSONObject(optionsJson as Map<String, Any?>).toString()
 
-        // 2. Wipe any prior identity BEFORE the credential prompt so a
-        //    track() during the prompt doesn't bind to the previous
-        //    user.
-        wipe()
-
-        // 3. Credential Manager.
+        // 2. Credential Manager. The prior identity stays put across the
+        //    system sheet: cancelling it is a routine outcome (wrong account,
+        //    no passkey on this device, back gesture), and for an anonymous
+        //    user the refresh token dropped by an early wipe is the only handle
+        //    on their account. installSession() replaces it once a session has
+        //    actually been minted.
         val mgr = CredentialManager.create(activityContext)
         val getRequest = GetCredentialRequest(listOf(GetPublicKeyCredentialOption(requestJson)))
         val cmResp = runCatching { mgr.getCredential(activityContext, getRequest) }
@@ -161,7 +177,7 @@ class SendoraCloudPasskeys internal constructor(
             ?: return Result.failure(PasskeyError.CredentialManagerFailed("Credential is not a passkey"))
         val responseJson = cred.authenticationResponseJson
 
-        // 4. Verify + mint session.
+        // 3. Verify + mint session.
         val parsed = runCatching { JSONObject(responseJson) }.getOrNull()
             ?: return Result.failure(PasskeyError.CredentialManagerFailed("Non-JSON authentication response"))
         val finishBody = mutableMapOf<String, Any>("response" to parsed.toMap())

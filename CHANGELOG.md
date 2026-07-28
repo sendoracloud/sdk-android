@@ -1,5 +1,27 @@
 # Changelog
 
+## 4.13.0 — response parsing fixed (auth now works end-to-end)
+
+**Fixed (blocking).** `ApiClient` converted only the top level of a response
+body into a Map, leaving `data`, `user`, `tokens` and `error` as
+`org.json.JSONObject`s — so every `as? Map` read of them returned null. Sign-in
+could never build a user object and always failed with "Malformed response";
+the same defect broke `listLinkedIdentities`, `listMySessions`, MFA enrollment,
+passkeys, all four Links calls, deferred attribution, the geofence list and the
+push `tokenId`. Bodies are now deep-converted (`JSONObject`→`Map`,
+`JSONArray`→`List`, JSON null→`null`) once, at the transport boundary.
+
+**Fixed (blocking).** A non-2xx response had its body discarded and returned
+`null`, so every backend error surfaced as a generic network failure with no
+code, status or `retryAfterSeconds` — making the 4.12.0 error taxonomy inert —
+and a wrong password tripped the circuit breaker. The body is now returned, the
+HTTP status is stamped onto the error envelope, and only a 5xx or a transport
+exception counts as a circuit-breaker failure.
+
+**Added.** `requestWithDetails` accepts `extraHeaders` (it previously could not
+send a Bearer header). First unit tests in this module: 10 JVM tests pinning the
+envelope contract.
+
 ## 4.10.0 — onDeletionCancelled (account-restore signal)
 
 New `auth.onDeletionCancelled(listener)` + `auth.getLastDeletionCancelled()` —

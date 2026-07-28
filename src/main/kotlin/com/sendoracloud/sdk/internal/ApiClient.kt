@@ -3,6 +3,7 @@ package com.sendoracloud.sdk.internal
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -19,6 +20,49 @@ import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
 import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
+
+/**
+ * Recursively convert an org.json tree into plain Kotlin collections.
+ *
+ * `org.json` hands back `JSONObject` / `JSONArray` for nested values, and
+ * `JSONObject.NULL` (a singleton, NOT Kotlin null) for JSON nulls. Converting
+ * only the top level leaves every nested value as a `JSONObject`, so an
+ * ordinary `as? Map<String, Any?>` cast against it silently yields null —
+ * which is exactly how the whole SDK reads a response envelope
+ * (`response["data"] as? Map`, `data["user"] as? Map`, `data as? List`).
+ * Converting the entire tree ONCE here, at the transport boundary, is what
+ * makes those casts work; doing it per-call-site is how the shallow version
+ * survived unnoticed.
+ */
+internal fun JSONObject.toDeepMap(): Map<String, Any?> =
+    keys().asSequence().associateWith { key -> unwrapJson(opt(key)) }
+
+internal fun JSONArray.toDeepList(): List<Any?> =
+    (0 until length()).map { index -> unwrapJson(opt(index)) }
+
+internal fun unwrapJson(value: Any?): Any? = when (value) {
+    null, JSONObject.NULL -> null
+    is JSONObject -> value.toDeepMap()
+    is JSONArray -> value.toDeepList()
+    else -> value
+}
+
+/** Parse a response body into plain Kotlin collections. Null when unparseable. */
+internal fun parseJsonBody(raw: String): Map<String, Any?>? =
+    runCatching { JSONObject(raw).toDeepMap() }.getOrNull()
+
+/**
+ * Stamp the HTTP status onto the envelope's `error` object so a caller can
+ * classify a failure the backend gave no `code` for (a bare 5xx, a gateway
+ * page). Deliberately does NOT synthesise an `error` when the body carries
+ * none — its absence is what makes a caller fall back to its own default
+ * code, and shipped apps string-match those.
+ */
+internal fun Map<String, Any?>.withErrorStatus(status: Int): Map<String, Any?> {
+    @Suppress("UNCHECKED_CAST")
+    val error = this["error"] as? Map<String, Any?> ?: return this
+    return this + ("error" to (error + ("status" to status)))
+}
 
 /**
  * HTTPS-only client with exponential backoff + circuit breaker.
@@ -98,12 +142,13 @@ internal class ApiClient(
         method: String,
         path: String,
         body: Map<String, Any?>?,
+        extraHeaders: Map<String, String>? = null,
     ): RichResponse {
         if (shouldSkip()) {
             return RichResponse(0, null, "NETWORK", "Circuit breaker open — too many recent failures")
         }
         return withTimeoutOrNull(10_000L) {
-            withContext(Dispatchers.IO) { doRichRequest(method, path, body) }
+            withContext(Dispatchers.IO) { doRichRequest(method, path, body, extraHeaders) }
         } ?: RichResponse(0, null, "NETWORK", "Request timed out")
     }
 
@@ -111,6 +156,7 @@ internal class ApiClient(
         method: String,
         path: String,
         body: Map<String, Any?>?,
+        extraHeaders: Map<String, String>? = null,
     ): RichResponse {
         val fullUrl = "$baseUrl/api/v1$path"
         if (!fullUrl.startsWith("https://") &&
@@ -133,6 +179,7 @@ internal class ApiClient(
             // that carry no version signal in their body.
             conn.setRequestProperty("X-Sendora-SDK-Name", SDK_NAME)
             conn.setRequestProperty("X-Sendora-SDK-Version", SDK_VERSION)
+            extraHeaders?.forEach { (k, v) -> conn.setRequestProperty(k, v) }
             conn.connectTimeout = 5_000
             conn.readTimeout = 5_000
             if (body != null) {
@@ -143,25 +190,19 @@ internal class ApiClient(
             val code = conn.responseCode
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
             val raw = BufferedReader(InputStreamReader(stream)).use { it.readText() }
-            val parsed: Map<String, Any?>? = runCatching {
-                val json = JSONObject(raw)
-                json.keys().asSequence().associateWith { key -> json.get(key) }
-            }.getOrNull()
+            val parsed = parseJsonBody(raw)
             if (code in 200..299) {
                 recordSuccess()
                 RichResponse(code, parsed, null, null)
             } else {
-                // 4xx isn't a transport failure — don't flip the breaker.
+                // The breaker guards the TRANSPORT, so any answer from the
+                // server clears it; only a 5xx or a thrown exception counts
+                // as a failure. A 4xx is the backend disagreeing with the
+                // request, and must never cost the caller its retry budget.
+                if (code >= 500) recordFailure() else recordSuccess()
                 @Suppress("UNCHECKED_CAST")
-                val err = (parsed?.get("error") as? JSONObject)?.let { eo ->
-                    mapOf("code" to (eo.opt("code") as? String), "message" to (eo.opt("message") as? String))
-                } ?: parsed?.get("error")?.let { e ->
-                    // already a Map (e.g. when JSON parsed differently)
-                    (e as? Map<String, Any?>)
-                }
-                val errCode = err?.get("code") as? String
-                val errMsg = err?.get("message") as? String
-                RichResponse(code, parsed, errCode, errMsg)
+                val err = parsed?.get("error") as? Map<String, Any?>
+                RichResponse(code, parsed, err?.get("code") as? String, err?.get("message") as? String)
             }
         } catch (e: Exception) {
             SendoraCloudLogger.debug("API error ($path): ${e.javaClass.simpleName}")
@@ -212,13 +253,18 @@ internal class ApiClient(
             val code = conn.responseCode
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
             val response = BufferedReader(InputStreamReader(stream)).use { it.readText() }
-            if (code !in 200..299) {
-                recordFailure()
-                null
-            } else {
+            if (code in 200..299) {
                 recordSuccess()
-                val json = JSONObject(response)
-                json.keys().asSequence().associateWith { key -> json.get(key) }
+                parseJsonBody(response)
+            } else {
+                // A 4xx is the backend answering, not the transport failing:
+                // returning null here threw away `error.code` /
+                // `error.details.retryAfterSeconds` and left every caller
+                // unable to tell a wrong password from being offline. It also
+                // let a wrong password arm the circuit breaker and lock the
+                // client out of its own retry.
+                if (code >= 500) recordFailure() else recordSuccess()
+                parseJsonBody(response)?.withErrorStatus(code)
             }
         } catch (e: Exception) {
             // No response-body details from this layer — keeps backend

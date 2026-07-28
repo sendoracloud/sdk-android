@@ -193,6 +193,22 @@ internal class Storage(context: Context) {
             ?.apply()
     }
 
+    /**
+     * Drop the cached user record + access token but KEEP the refresh token.
+     * For the corrupt-cache path only: an unreadable `auth_user` blob (torn
+     * write, process killed mid-persist) says nothing about the refresh token,
+     * which is independently valid and is the only thing that can still recover
+     * the account — deleting it there turns a recoverable cache glitch into a
+     * permanently orphaned account for an anonymous user.
+     */
+    fun clearCachedUser() {
+        securePrefs?.edit()
+            ?.remove("auth_access_token")
+            ?.remove("auth_access_expires")
+            ?.remove("auth_user")
+            ?.apply()
+    }
+
     fun saveEventQueue(events: List<Map<String, Any?>>) {
         try {
             val jsonArray = JSONArray()

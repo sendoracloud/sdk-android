@@ -18,6 +18,9 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     buildFeatures { buildConfig = false }
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
     publishing {
         singleVariant("release") {
             withSourcesJar()
@@ -47,6 +50,10 @@ dependencies {
     compileOnly("com.android.installreferrer:installreferrer:2.2")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+    // Real org.json on the unit-test classpath. The mockable android.jar stubs
+    // every org.json method to throw, so without this the envelope-parsing
+    // tests would exercise nothing.
+    testImplementation("org.json:json:20231013")
 }
 
 afterEvaluate {
@@ -57,7 +64,7 @@ afterEvaluate {
                 groupId = "com.sendoracloud"
                 artifactId = "sdk-android"
                 // Keep in lockstep with internal/SdkVersion.kt SDK_VERSION (ADR-023 §7).
-                version = "4.11.0"
+                version = "4.14.0"
                 pom {
                     name.set("Sendora Cloud Android SDK")
                     description.set("Deep linking, attribution, and event tracking for Android.")

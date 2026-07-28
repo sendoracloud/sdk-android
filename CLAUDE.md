@@ -120,6 +120,213 @@ class MyFcm : FirebaseMessagingService() {
 - Battery Optimization may delay updates on aggressive OEMs (Xiaomi, Huawei). Android lacks Apple-style update budgets.
 - ProgressStyle requires API 34+; older Android uses BigTextStyle.
 
+## 4.14.0 — anonymous-session reuse + total error coercion (s58.271d)
+
+Parity with RN 1.29.0 / web 3.13.0 / iOS 4.14.0.
+
+- **A corrupt user blob is now actually recoverable.** Keeping the refresh token
+  when the cached user fails to parse was only half a fix: nothing could turn
+  that token back into an identity, because the refresh discarded the `user` the
+  backend returns in the very same response — so the session sat live with a
+  permanently null user and the next sign-in orphaned the account anyway. The
+  refresh now adopts that user, but **only when there is none** (a refresh is a
+  token rotation, not an identity change), only when it is well-formed (the
+  route tolerates a missing user row), and it emits `signed_in` because
+  recovering an identity IS a transition — while a plain rotation with a user
+  already present still emits nothing.
+
+- **`signInAnonymously()` reuses an existing anonymous session.** It minted a
+  brand-new user unconditionally, and `persist()` overwrote the stored refresh
+  token — the previous anonymous account's ONLY durable handle — with no
+  takeover, no webhook and no state event. An app calling it defensively on
+  every cold launch (the most natural thing to write) fragmented the player
+  across a new `user_id` per launch: the same lost-progress outcome as a failed
+  sign-in wiping the session, except on a **healthy** network. Now short-circuits
+  when the cached user is anonymous AND a refresh token is on disk (Firebase's
+  `signInAnonymously` does exactly this). Opt out with `forceNew`.
+- **Every rejection carries a `kind`.** A new `asAuthError` coercion at the
+  op boundary maps a timeout to `kind: network` and anything unmapped to
+  `kind: unknown`. **The default must stay non-fatal** — that is what makes the
+  one-code `isDeadRefreshError` allow-list safe rather than lucky: an unmapped
+  failure can only become session-fatal through a deliberate edit. Firebase
+  enforces the same rule at its HTTP boundary, with a comment warning that
+  changing it logs users out on network errors. Typed errors shipped apps match
+  with `instanceof` (`EmailAlreadyTaken` / `AlreadyIdentified` /
+  `CredentialInUse`) pass through untouched.
+
+Both gaps came from a cross-SDK architecture study (Firebase, Supabase, Auth0,
+Clerk, Amplify/Cognito, RevenueCat) read against our own source. The anonymous
+overwrite was independently flagged by the adversarial review of s58.271.
+
+`forceNew: Boolean = false` is a defaulted third argument (source-compatible). Coercion is applied at three shapes, not one: `serialize` (mutex + coercion, so a newly added mutating op cannot miss it), `guardedResult` (the 9 unlocked `Result` ops), and `guardedValue`. **`CancellationException` is rethrown BEFORE the catch-all** — Kotlin structured concurrency requires it, and reporting a cancelled coroutine as a `Result.failure` would let abandoned work report back. Android's transport already returned `null` on timeout (→ `Network`), so as on web this is the general rule rather than a symptom fix. Tests: `AuthErrorCoercionTest` 8/8 + `ApiClientEnvelopeTest` 10/10. The reuse guard is pinned by source assertions (instantiating the class needs a Context-backed Storage); the pin was mutation-tested by deleting the guard.
+
+## 4.14.0 — token refresh shape + the remaining loss routes (s58.271b)
+
+Parity with RN 1.29.0 / web 3.13.0 / iOS 4.14.0. See the RN CLAUDE.md 1.29.0
+section for the full write-up.
+
+- **⚠ `/token/refresh` shape (CRITICAL, pre-existing).** `refreshAccessToken`
+  read `data["accessToken"]`, but the rotated trio lives under `data.tokens`
+  (flat was abandoned in s58.76). Refresh silently returned null forever — the
+  session died at access-token expiry and the app minted a fresh guest, the same
+  account loss 4.12.0 exists to prevent. Both levels accepted now.
+- **A generic 401 no longer wipes the session.** `isDeadRefreshError` narrowed to
+  `INVALID_REFRESH_TOKEN`; `UNAUTHORIZED`/`HTTP_401` is also what the API-key
+  middleware returns for a rotated publishable key, so a key rotation would have
+  wiped every install's anonymous account at once.
+- **The refresh race, both directions** — gated by `tokenStillCurrent(sent)`.
+- **Auth-state listeners are dispatched off the mutex.** `emitAuthState` ran
+  inline while `mutex` was held, so a listener calling any suspend auth method
+  (`signOut()` from an `onAuthStateChanged` handler) deadlocked permanently.
+
+## 4.13.0 — ApiClient response parsing: two defects that made the whole SDK's nested reads dead
+
+Two independent, PRE-EXISTING transport defects. Neither was introduced by
+4.12.0; the taxonomy work simply made the first one impossible to ignore. Both
+are fixed at the transport boundary, so every existing call site starts working
+without being touched.
+
+**1. A non-2xx response threw its own body away.** `ApiClient.request()` read
+the error body and then returned `null`, so every 4xx/5xx reached
+`SendoraCloudAuth.parseError` as `Network("Network request failed")` — no
+`error.code`, no status, no `error.details.retryAfterSeconds`. The 4.12.0
+taxonomy was therefore **inert against the real backend**: `NOT_ANONYMOUS`,
+`CONFLICT`, `CREDENTIAL_IN_USE`, `ACCOUNT_LOCKED` and 429 were all unreachable,
+and every failure classified as `NETWORK` (retryable) no matter what actually
+happened. It also called `recordFailure()` on 4xx, so **a wrong password armed
+the circuit breaker** and locked the client out of its own retry. Non-2xx now
+returns the parsed body; the breaker is only tripped by a 5xx or a thrown
+exception, because it guards the TRANSPORT and a 4xx means the server answered.
+
+**2. Only the TOP level of the envelope was converted to a Map.** `org.json`
+returns `JSONObject` / `JSONArray` for nested values, so `data`, `user`,
+`tokens`, `error`, `error.details` all stayed `JSONObject`s — and every
+`as? Map<String, Any?>` cast against them silently yielded null. The blast
+radius is the whole SDK, not just auth: `parseSuccess` could never return a
+user (so `callAuth` always failed "Malformed response" and `persist()` never
+ran — **Android auth has never worked end-to-end**, consistent with the module
+not compiling at all before 4.8.2), plus `parseLinkedUser`, `deleteAccount`,
+`listLinkedIdentities` (also `JSONArray` vs `List`), `listMySessions`,
+`enrollMfa`/`confirmMfa`, `SendoraCloudPasskeys`' start/finish envelopes, all
+four `SendoraCloudLinks` rich paths, deferred-attribution `data.found`, the
+geofence list, and the push `tokenId` read. The body is now deep-converted once
+(`JSONObject`→`Map`, `JSONArray`→`List`, `JSONObject.NULL`→`null`) in BOTH
+`request()` and `doRichRequest()`.
+
+Also: `requestWithDetails`/`doRichRequest` gained the `extraHeaders` parameter
+`request()` always had (it could not send a Bearer header, so it was unusable
+for any authenticated route), and `parseError` reads the HTTP status that
+`withErrorStatus` stamps onto the error envelope — so a failure the backend
+gave no `code` for still classifies (5xx→`SERVER`, 429→`RATE_LIMITED`) instead
+of collapsing to `UNKNOWN`. `withErrorStatus` deliberately does NOT synthesise
+an `error` object when the body carries none: its absence is what makes a
+caller fall back to its own default code, and shipped apps string-match those.
+
+**Tests — the module's first.** `src/test/kotlin/.../ApiClientEnvelopeTest.kt`
+(10 JVM tests) asserts the exact cast expressions the production parsers use,
+against real backend envelope shapes: the login success envelope down to
+`data.user.id` / `data.tokens.accessToken`, `retiredAnonUserId` +
+`reactivatedFromDeletion`, a JSON `null` arriving as Kotlin null rather than the
+`JSONObject.NULL` sentinel, `ACCOUNT_LOCKED` with `error.details.retryAfterSeconds`
++ the stamped status, the `listLinkedIdentities` array-of-objects, a top-level
+array (geofences/sessions), deep nesting, and an unparseable body. Wired via a
+new `src/test` source set — `testOptions.unitTests.isReturnDefaultValues` plus a
+real `org.json:json` on the test classpath, because the mockable `android.jar`
+stubs every `org.json` method to throw. **Verified they catch the regression:**
+reverting `toDeepMap` to the old shallow form fails 7 of the 10.
+
+`./gradlew testDebugUnitTest` → 10/10, and `./gradlew :publishToMavenLocal`
+(JitPack's command) → BUILD SUCCESSFUL. ⚠ A live sign-in against a real project
+is still the gate that matters and is operator-owned — these tests prove the
+envelope contract, not the network. Additive — no frozen SharedPreferences key /
+header / route / wire shape touched (ADR-023), no public signature changed.
+
+## 4.12.0 — a failed sign-in can no longer destroy the account (s58.271)
+
+**The bug (customer-reported, HIGH — silent permanent data loss).** Every
+credentialed sign-in cleared local identity — *including the refresh token* —
+BEFORE its network call, and no failure path restored it. For an anonymous user
+that refresh token is the ONLY durable handle on the account, so once the wipe
+landed and the call failed the account was unreachable from the device forever.
+Offline it was not a race but a **guarantee**. Word Hurdle lost a real production
+account this way on iOS (30 purchases incl. an active subscription, 3,355-gem
+balance); Android carried the same defect at **seven** sites — the worst of the
+four SDKs: `signIn`, `signInWithMfaSupport`, `loginSocial` (and all seven
+`signInWith*` wrappers), `signInWithPlayGames`, `verifyMagicLink`,
+`verifyEmailOtp`, and `passkeys.authenticate`, which wiped *before* the
+Credential Manager sheet — where cancelling is a routine outcome, not an error.
+`signInWithMfaSupport` was worse still: it never read `prevAnonRefreshToken` at
+all, so even a **successful** MFA sign-in destroyed the anon refresh without
+triggering device-takeover (anon row leaked server-side, `onDeviceTakeover` never
+fired). It now forwards the hint exactly like `signIn`.
+
+**The invariant now, everywhere: a failed auth attempt leaves the caller exactly
+as it found them.** Each path reads the anon refresh into a local, makes the
+call, validates the response, and only then wipes + persists — the shape
+`challengeMfa` already used and which was simply never propagated to its
+siblings. The shared executor carries it: `callAuth(path, body,
+replacesIdentity)` does the wipe itself, between `parseSuccess` and `persist`.
+`replacesIdentity` is deliberately FALSE for `/anonymous` and the in-place
+`/upgrade` — those keep the same subject, so rotating the device id and dropping
+the queued events under them would orphan attribution that legitimately belongs
+to the user. The passkey path moved its wipe into the `installSession` lambda
+(after `parseSuccess`), so the `wipe` constructor param is gone from
+`SendoraCloudPasskeys`. `signOut()` still wipes first — the caller asked to lose
+the session. Same fix in RN 1.28.0 / web 3.12.0 / iOS 4.13.0.
+
+Four things ship alongside it:
+
+- **Error taxonomy — `SendoraCloudAuthError.kind` / `.retryable` / `.code` /
+  `.status` / `.retryAfterSeconds`.** New `SendoraCloudAuthErrorKind` enum
+  (`NETWORK` · `SERVER` · `RATE_LIMITED` · `INVALID_CREDENTIAL` ·
+  `ACCOUNT_LOCKED` · `CREDENTIAL_IN_USE` · `ALREADY_IDENTIFIED` · `CANCELLED` ·
+  `CONFIG` · `UNKNOWN`) with `SendoraCloudAuthErrorKind.classify(code, status)`
+  mirroring the RN classifier 1:1; retryable = network/server/rate_limited/
+  account_locked. The error **classes are unchanged** (`when (err) { is
+  Unauthorized -> … }` keeps working) and no message string was reworded —
+  `Unknown` still reads `"$code: $message"`. `PasskeyError` gains the same `kind`
+  so one taxonomy covers every sign-in path (`UserCancelled` → `CANCELLED`).
+  `retryAfterSeconds` is read off `error.details` (429 backoff, the new backend
+  `ACCOUNT_LOCKED` 403 cool-off).
+- **`onAuthStateChanged(listener)`** — one stream (`AuthStateChange.SignedIn` /
+  `SignedOut(reason)` / `DeviceTakeover` / `DeletionCancelled`) returning an
+  unsubscribe lambda, same UUID-keyed `ConcurrentHashMap` + `runCatching` posture
+  as `onDeviceTakeover`, which keeps firing unchanged alongside it. The
+  load-bearing case is `AuthSignedOutReason.SESSION_EXPIRED`: a session killed in
+  the background (server rejected the stored refresh) previously emitted
+  **nothing**, so an app could not tell it from a deliberate sign-out and only
+  noticed when `getAccessToken()` returned null. Replays `SignedIn` on subscribe
+  once restore has run (never before — reporting "signed out" mid-restore would
+  be a lie); a signed-out cold start emits nothing, and a FAILED sign-in emits
+  nothing (no state changed). The internal wipe that precedes a successful
+  `persist()` is `WipeReason.REPLACED` and emits no `SignedOut`, so one sign-in
+  reads as one `SignedIn`, not a logout/login pair.
+- **A rate limit is no longer treated as a dead session.** `isDeadRefreshError`
+  dropped `RATE_LIMIT`/`RATE_LIMIT_EXCEEDED`: a 429 is transient throttling (a
+  shared NAT/CGN egress, a refresh burst) and says nothing about token validity,
+  yet it was wiping live sessions from the background refresh path. Kept:
+  `INVALID_REFRESH_TOKEN`/`UNAUTHORIZED`/`HTTP_401`. Relatedly the constructor's
+  corrupt-cache guard now calls a new `Storage.clearCachedUser()` (user + access
+  token) instead of `clearAuthTokens()` — an unreadable `auth_user` blob says
+  nothing about the refresh token, which is the only thing that can still recover
+  the account.
+- **`deleteAccount()` requires a confirmed success before wiping.** It keyed off
+  the presence of an `error` object, so a `success:false` body with no error
+  slipped through and wiped anyway — account alive server-side, credential gone
+  from the device. Now gated on `success == true`.
+
+**⚠ The taxonomy shipped INERT in this version — 4.13.0 is what makes it work.**
+Two pre-existing `ApiClient` defects (a non-2xx response discarding its own body,
+and only the top level of the envelope being converted to a Map) meant every
+backend error reached `parseError` as a bare `Network(...)` and `parseSuccess`
+never returned a user at all. `objectField()` here reads either shape wherever
+the taxonomy needs the envelope, but the transport itself had to be fixed —
+see the 4.13.0 section above. Anything below describing taxonomy behaviour is
+only true from **4.13.0** onward.
+`./gradlew :publishToMavenLocal` BUILD SUCCESSFUL. Additive — no frozen
+SharedPreferences key / header / route / wire shape touched (ADR-023), no error
+class or message renamed, no public signature changed.
+
 ## 4.11.0 — listLinkedIdentities() (read side of ADR-030, s58.270)
 
 `auth.listLinkedIdentities(): Result<LinkedIdentitiesResult>` (suspend) where
