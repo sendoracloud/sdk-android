@@ -5,6 +5,30 @@ Published at `github.com/sendoracloud/sdk-android`, consumed via JitPack (`com.g
 > ⚠ **ADR-023 frozen contract.** SharedPreferences keys (`auth_*`, `event_queue`, `device_id`, `session_id`, …), the `X-Sendora-SDK-{Name,Version}` headers, and the `schema_version` marker are depended on by installed apps — never rename/remove a key (orphans session/queue on upgrade) or drop the header/marker. Version lives ONLY in `SdkVersion.kt` (must equal `build.gradle.kts`). Additive only; a format change is MAJOR + needs a migration. CI cap: `apps/backend/src/modules/developer-tools/sdk-contract-golden.test.ts`. Law: `docs/decisions/023-sdk-api-compatibility.md`.
 
 
+
+## 4.16.0 — onDeviceTakeover doc fix: the account-deleting paths were missing (s58.273)
+
+Parity: RN 1.31.0 / web 3.15.0 / iOS 4.16.0. **Documentation-only in the SDK; no behaviour change.**
+
+Customer-reported (Word Hurdle). The doc comment on `onDeviceTakeover` enumerated
+where the listener fires — signIn / loginSocial / verifyMagicLink / verifyEmailOtp
+/ challengeMfa / passkey / SSO — and **omitted the Game Center and Play Games
+paths, the only ones that can DELETE an account.** It does fire there (centrally,
+from the persist path), so this was purely a doc defect; but an integrator reading
+that list would reasonably conclude a gaming adopt produces no takeover and skip
+the one handler that path most needs. That is the path that destroys accounts.
+
+The comment now names the gaming sign-ins explicitly and states the consequence:
+a takeover means the anonymous account was retired — its row DELETED server-side
+— while **the call itself resolved successfully**, so this listener is the only
+client-side signal. It also points at `onCredentialInUse: reject` for callers
+who would rather it not happen.
+
+Guarded so the list cannot drift again: `credential-collision.test.ts` asserts
+each SDK's doc block (the 1600 chars immediately above the declaration, not the
+whole file) names its gaming path. Mutation-proven — redacting the tokens from
+all four doc windows fails 4.
+
 ## 4.15.0 — credential-collision policy + anonymous link promotion (s58.272)
 
 Parity: RN 1.30.0 / web 3.14.0 / iOS 4.15.0. Full write-up in the RN CLAUDE.md 1.30.0 section.
