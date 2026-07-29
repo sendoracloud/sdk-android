@@ -4,6 +4,30 @@ Published at `github.com/sendoracloud/sdk-android`, consumed via JitPack (`com.g
 
 > ⚠ **ADR-023 frozen contract.** SharedPreferences keys (`auth_*`, `event_queue`, `device_id`, `session_id`, …), the `X-Sendora-SDK-{Name,Version}` headers, and the `schema_version` marker are depended on by installed apps — never rename/remove a key (orphans session/queue on upgrade) or drop the header/marker. Version lives ONLY in `SdkVersion.kt` (must equal `build.gradle.kts`). Additive only; a format change is MAJOR + needs a migration. CI cap: `apps/backend/src/modules/developer-tools/sdk-contract-golden.test.ts`. Law: `docs/decisions/023-sdk-api-compatibility.md`.
 
+
+## 4.15.0 — credential-collision policy + anonymous link promotion (s58.272)
+
+Parity: RN 1.30.0 / web 3.14.0 / iOS 4.15.0. Full write-up in the RN CLAUDE.md 1.30.0 section.
+
+- **`onCredentialInUse` (`adopt`|`reject`)** on the credentialed sign-in
+  methods. **Omitted = adopt = every prior release** (no field is sent). On a
+  collision the sign-in ADOPTS the owning account and — because the anon refresh
+  hint is forwarded whenever the local user is anonymous — the server hard-deletes
+  this device's anonymous row. That is a 200, so the wipe-ordering fix never
+  covered it. `reject` fails with the credential-in-use error and changes nothing.
+- **The collision error carries the taxonomy** (`kind`/`retryable`/`code`/`status`)
+  plus `provider` + `collision` (`identity`|`email`).
+- **Linking from an ANONYMOUS session** promotes the account in place (sub
+  preserved) and the server ROTATES the session, because the `is_anonymous` JWT
+  claim changed. The link path installs the returned `tokens` when the response
+  carries `upgraded: true` — **not optional**, the old refresh token is revoked
+  server-side. An identified link is unchanged (no tokens, cached user updated in
+  place). Firebase `linkWithCredential` / Supabase `linkIdentity` parity.
+
+`CredentialCollisionPolicy` is a defaulted (`null`) parameter on `loginSocial` +
+`signInWithPlayGames`, so every existing call site compiles unchanged.
+`:publishToMavenLocal` + `testDebugUnitTest` green.
+
 ## Public API
 
 ```kotlin

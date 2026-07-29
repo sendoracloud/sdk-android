@@ -86,6 +86,30 @@ data class SendoraCloudAuthUser(
  * Credential Manager sheet and a 429 all leave [SendoraCloudAuth.currentUser]
  * and the stored refresh token exactly as they were.
  */
+/**
+ * What a credentialed sign-in should do when the credential you present already
+ * belongs to an account (4.15.0).
+ *
+ * - [ADOPT] (the default when this is omitted, and what every earlier release
+ *   did unconditionally): sign in to that account. This is the
+ *   reinstall-recovery path — a Play Games player identity survives a reinstall
+ *   server-side, so the "collision" is usually the SAME person's earlier
+ *   account. If this device is anonymous, that anonymous account is retired:
+ *   **its row is deleted** and the device-takeover listener fires with its id.
+ * - [REJECT]: fail with [SendoraCloudAuthError.CredentialInUse] and change
+ *   nothing at all. Use it when the local anonymous session holds progress you
+ *   are not willing to trade. Mirrors Firebase `linkWithCredential`
+ *   (`auth/credential-already-in-use`) and Supabase `linkIdentity`.
+ *
+ * [REJECT] blocks the switch; it does not merge the two accounts. To offer "use
+ * my other account", catch the error and re-call with [ADOPT], then migrate
+ * your own data from the takeover listener's `retiredAnonUserId`.
+ */
+enum class CredentialCollisionPolicy(val wire: String) {
+    ADOPT("adopt"),
+    REJECT("reject"),
+}
+
 enum class SendoraCloudAuthErrorKind {
     NETWORK,
     SERVER,
@@ -726,6 +750,13 @@ class SendoraCloudAuth internal constructor(
         // (like Firebase linkWithCredential) instead of a device-takeover that
         // mints a new id. No effect off-anon or on a collision.
         link: Boolean = false,
+        /**
+         * What to do if this social identity (or its verified email) already
+         * belongs to an account. `null` (default) = the server's `adopt` =
+         * every prior release. [CredentialCollisionPolicy.REJECT] fails with
+         * [SendoraCloudAuthError.CredentialInUse] and changes nothing.
+         */
+        onCredentialInUse: CredentialCollisionPolicy? = null,
     ): Result<SendoraCloudAuthUser> = serialize {
         if (!storage.isSecureAvailable) {
             return@serialize Result.failure(SendoraCloudAuthError.SecureStorageUnavailable("EncryptedSharedPreferences unavailable"))
@@ -750,6 +781,9 @@ class SendoraCloudAuth internal constructor(
             prevAnonRefreshToken?.let { put("prevAnonRefreshToken", it) }
             // ADR-025: opt into link-in-place (backend ignores it unless anon + new identity).
             if (link) put("linkAnonymous", true)
+            // Only sent when explicitly chosen — omitted is the backend's
+            // "adopt" default, i.e. exactly what every prior release did.
+            onCredentialInUse?.let { put("onCredentialInUse", it.wire) }
         }
         callAuth("/auth-service/login/social", body, replacesIdentity = true)
     }
@@ -765,7 +799,17 @@ class SendoraCloudAuth internal constructor(
      * KEEPS the same user id when upgrading an anonymous device (ADR-025
      * link-in-place); no effect off-anon or on a collision.
      */
-    suspend fun signInWithPlayGames(serverAuthCode: String, link: Boolean = false): Result<SendoraCloudAuthUser> = serialize {
+    suspend fun signInWithPlayGames(
+        serverAuthCode: String,
+        link: Boolean = false,
+        /**
+         * What to do if this Play Games player identity already belongs to an
+         * account. `null` (default) = the server's `adopt` = every prior
+         * release. [CredentialCollisionPolicy.REJECT] fails with
+         * [SendoraCloudAuthError.CredentialInUse] and changes nothing.
+         */
+        onCredentialInUse: CredentialCollisionPolicy? = null,
+    ): Result<SendoraCloudAuthUser> = serialize {
         if (!storage.isSecureAvailable) {
             return@serialize Result.failure(SendoraCloudAuthError.SecureStorageUnavailable("EncryptedSharedPreferences unavailable"))
         }
@@ -780,6 +824,8 @@ class SendoraCloudAuth internal constructor(
             prevAnonRefreshToken?.let { put("prevAnonRefreshToken", it) }
             // ADR-025: opt into link-in-place (backend ignores it unless anon + new identity).
             if (link) put("linkAnonymous", true)
+            // See loginSocial — omitted means the server's "adopt".
+            onCredentialInUse?.let { put("onCredentialInUse", it.wire) }
         }
         callAuth("/auth-service/login/play-games", body, replacesIdentity = true)
     }
@@ -1105,6 +1151,26 @@ class SendoraCloudAuth internal constructor(
         if (err != null) return@serialize Result.failure(err)
         val user = parseLinkedUser(response)
             ?: return@serialize Result.failure(SendoraCloudAuthError.Unknown("Malformed link response"))
+        // 4.15.0 — linking a provider identity from an ANONYMOUS session
+        // promotes this account in place (sub preserved) and the server rotates
+        // the session, because the `is_anonymous` JWT claim just changed. The
+        // old refresh token is revoked server-side, so installing the returned
+        // pair is NOT optional: skip it and this device is signed out at the
+        // next refresh. An identified link returns no tokens and keeps the
+        // ADR-030 in-place behaviour.
+        @Suppress("UNCHECKED_CAST")
+        val data = response?.get("data") as? Map<String, Any?>
+        // Gate on the tokens ACTUALLY parsing, not just on the flag: `persist`
+        // no-ops when `parseSuccess` returns null, so committing to this branch
+        // on a malformed response would leave the row still marked anonymous
+        // locally, holding tokens the server has already revoked — i.e. signed
+        // out at the next refresh. Falling through to `updateLocalUser` keeps
+        // the live session instead. (RN/web get this from `isAuthApiResponse`,
+        // iOS from the `parseTokens` binding.)
+        if (data?.get("upgraded") == true && parseSuccess(response) != null) {
+            persist(response!!)
+            return@serialize Result.success(user)
+        }
         updateLocalUser(user)
         Result.success(user)
     }
