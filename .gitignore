@@ -1,0 +1,13 @@
+# Exists for the PUBLIC MIRROR (github.com/sendoracloud/sdk-android), not for
+# the monorepo — the root .gitignore already covers these here. `publish-native-
+# mirror.mjs` rsyncs this directory into the mirror clone, so without a
+# package-level file the mirror tracks no ignore rules at all (s58.272: a
+# `--delete` push removed the one it had).
+#
+# NOTE: do NOT ignore `gradle/wrapper/` or `gradlew` — JitPack needs the
+# committed wrapper, and its absence 127-failed every Android release before
+# 4.8.1.
+build/
+.gradle/
+local.properties
+.DS_Store

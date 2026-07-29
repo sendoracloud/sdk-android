@@ -6,6 +6,34 @@ Published at `github.com/sendoracloud/sdk-android`, consumed via JitPack (`com.g
 
 
 
+## 4.17.0 — the collision default is now safe by construction (s58.274)
+
+Parity: RN 1.32.0 / web 3.16.0 / iOS 4.17.0. **Behaviour change to the DEFAULT** — see below for who it affects (in practice: nobody with real users).
+
+`onCredentialInUse` shipped in the previous release with a default of `adopt`, kept
+for compatibility. That was the wrong call: the destructive path was what you got by
+not knowing the option existed, and it succeeded silently, so there was no error to
+prompt a second look. The next integrator would have had to lose an account to learn.
+
+**The hazard was never "a collision happened" — it is "a collision happened AND
+adopting would DELETE a live guest account on this device".** Those deserve different
+answers, and now get them:
+
+- **Fresh install / no guest session** → nothing to lose, so it adopts. This is the
+  reinstall-recovery path, and it is never refused.
+- **Live guest session** → adopting would retire it (row deleted). Refused with
+  `CREDENTIAL_IN_USE` so the app can ask the player.
+
+So the safe behaviour is now the behaviour, and `onCredentialInUse` becomes a pure
+override: `"adopt"` to switch anyway (the old semantics), `"reject"` to fail on any
+collision at all.
+
+⚠ **If you relied on silent adopt** — i.e. you consume the device-takeover signal to
+migrate progress on a returning player — pass `onCredentialInUse: "adopt"` explicitly.
+Everything else is unchanged: the adopt path still retires the row and still fires the
+takeover webhook.
+
+
 ## 4.16.0 — onDeviceTakeover doc fix: the account-deleting paths were missing (s58.273)
 
 Parity: RN 1.31.0 / web 3.15.0 / iOS 4.16.0. **Documentation-only in the SDK; no behaviour change.**

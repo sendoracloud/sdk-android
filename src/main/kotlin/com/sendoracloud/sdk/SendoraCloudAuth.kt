@@ -90,18 +90,23 @@ data class SendoraCloudAuthUser(
  * What a credentialed sign-in should do when the credential you present already
  * belongs to an account (4.15.0).
  *
- * - [ADOPT] (the default when this is omitted, and what every earlier release
- *   did unconditionally): sign in to that account. This is the
- *   reinstall-recovery path — a Play Games player identity survives a reinstall
- *   server-side, so the "collision" is usually the SAME person's earlier
- *   account. If this device is anonymous, that anonymous account is retired:
- *   **its row is deleted** and the device-takeover listener fires with its id.
- * - [REJECT]: fail with [SendoraCloudAuthError.CredentialInUse] and change
- *   nothing at all. Use it when the local anonymous session holds progress you
- *   are not willing to trade. Mirrors Firebase `linkWithCredential`
- *   (`auth/credential-already-in-use`) and Supabase `linkIdentity`.
+ * **You usually want the default — pass null.** Since 4.17.0 the default is
+ * safe by construction: it adopts the other account silently when nothing would
+ * be destroyed, and refuses when something would be.
  *
- * [REJECT] blocks the switch; it does not merge the two accounts. To offer "use
+ * - **Fresh install / no guest session** → nothing to lose, so it adopts. This
+ *   is the reinstall-recovery path — a Play Games identity survives a reinstall
+ *   server-side, so the collision is usually the SAME person's earlier account,
+ *   and they get it back. Never refused.
+ * - **Live guest session** → adopting would retire it (**its row is deleted**
+ *   and the device-takeover listener fires). Refused with
+ *   [SendoraCloudAuthError.CredentialInUse] so you can ask the player.
+ *
+ * Override in either direction: [ADOPT] always adopts, even when it deletes the
+ * guest account (pre-4.15.0 behaviour); [REJECT] always fails on a collision,
+ * even a harmless one.
+ *
+ * ⚠ A refusal blocks the switch; it does not merge the two accounts. To offer "use
  * my other account", catch the error and re-call with [ADOPT], then migrate
  * your own data from the takeover listener's `retiredAnonUserId`.
  */
@@ -764,9 +769,8 @@ class SendoraCloudAuth internal constructor(
         link: Boolean = false,
         /**
          * What to do if this social identity (or its verified email) already
-         * belongs to an account. `null` (default) = the server's `adopt` =
-         * every prior release. [CredentialCollisionPolicy.REJECT] fails with
-         * [SendoraCloudAuthError.CredentialInUse] and changes nothing.
+         * belongs to an account. **Leave it null** — the default refuses only
+         * when a live guest session would be deleted.
          */
         onCredentialInUse: CredentialCollisionPolicy? = null,
     ): Result<SendoraCloudAuthUser> = serialize {
@@ -816,9 +820,8 @@ class SendoraCloudAuth internal constructor(
         link: Boolean = false,
         /**
          * What to do if this Play Games player identity already belongs to an
-         * account. `null` (default) = the server's `adopt` = every prior
-         * release. [CredentialCollisionPolicy.REJECT] fails with
-         * [SendoraCloudAuthError.CredentialInUse] and changes nothing.
+         * account. **Leave it null** — the default refuses only when a live
+         * guest session would be deleted.
          */
         onCredentialInUse: CredentialCollisionPolicy? = null,
     ): Result<SendoraCloudAuthUser> = serialize {
