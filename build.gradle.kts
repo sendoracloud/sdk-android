@@ -64,7 +64,7 @@ afterEvaluate {
                 groupId = "com.sendoracloud"
                 artifactId = "sdk-android"
                 // Keep in lockstep with internal/SdkVersion.kt SDK_VERSION (ADR-023 §7).
-                version = "4.17.0"
+                version = "4.18.0"
                 pom {
                     name.set("Sendora Cloud Android SDK")
                     description.set("Deep linking, attribution, and event tracking for Android.")

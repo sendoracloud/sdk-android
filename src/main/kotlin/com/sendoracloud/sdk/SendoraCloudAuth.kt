@@ -284,6 +284,28 @@ data class DeviceTakeoverEvent(
  * Fires once per sign-in that cancelled a pending self-service account deletion
  * within its grace window — the account is restored with the SAME user_id.
  */
+/**
+ * What happened to the guest ("anonymous") account this device presented, on a
+ * sign-in that produced an identified session (s58.278).
+ *
+ * The one worth acting on is [PRESERVED]: a guest account was presented, was
+ * NOT retired, and is therefore still alive server-side — so offering the
+ * player "recover your other account" is a real offer rather than a guess.
+ */
+enum class AnonRetirementOutcome(val wire: String) {
+    /** The guest row was deleted; its id arrives via onDeviceTakeover. */
+    RETIRED("retired"),
+    /** A guest token WAS sent and the guest was NOT retired — it still exists. */
+    PRESERVED("preserved"),
+    /** No guest token was sent; nothing to reconcile. */
+    NONE("none");
+
+    companion object {
+        fun fromWire(raw: String?): AnonRetirementOutcome? =
+            entries.firstOrNull { it.wire == raw }
+    }
+}
+
 data class DeletionCancelledEvent(
     val userId: String,
     val at: Long,
@@ -334,6 +356,7 @@ class SendoraCloudAuth internal constructor(
     @Volatile private var lastTakeover: DeviceTakeoverEvent? = null
     private val deletionCancelledListeners = java.util.concurrent.ConcurrentHashMap<java.util.UUID, (DeletionCancelledEvent) -> Unit>()
     @Volatile private var lastDeletionCancelled: DeletionCancelledEvent? = null
+    @Volatile private var lastAnonRetirement: AnonRetirementOutcome? = null
     // 4.12.0 — single auth-state stream. Same UUID-keyed posture as the two
     // listeners above; those keep firing unchanged alongside it.
     private val authStateListeners = java.util.concurrent.ConcurrentHashMap<java.util.UUID, (AuthStateChange) -> Unit>()
@@ -656,6 +679,12 @@ class SendoraCloudAuth internal constructor(
 
     /** The most recent deletion-cancelled event this session, or null. */
     fun getLastDeletionCancelled(): DeletionCancelledEvent? = lastDeletionCancelled
+
+    /**
+     * What the last sign-in did with this device's guest account, or null if no
+     * sign-in has happened this session (s58.278). See [AnonRetirementOutcome].
+     */
+    fun getLastAnonRetirement(): AnonRetirementOutcome? = lastAnonRetirement
 
     internal fun fireDeletionCancelled(identifiedUserId: String) {
         val evt = DeletionCancelledEvent(userId = identifiedUserId, at = System.currentTimeMillis())
@@ -1585,6 +1614,11 @@ class SendoraCloudAuth internal constructor(
             fireDeviceTakeover(retiredAnonUserId, user.id)
             emitAuthState(AuthStateChange.DeviceTakeover(user, retiredAnonUserId))
         }
+        // s58.278 — record the guest-account outcome. Only when the server
+        // states it; an older backend leaves the previous value untouched
+        // rather than asserting "nothing was retired".
+        AnonRetirementOutcome.fromWire(data?.get("anonRetirement") as? String)
+            ?.let { lastAnonRetirement = it }
         // s58.269 — fire onDeletionCancelled when this sign-in cancelled a
         // pending self-deletion within grace (account restored, same user_id).
         if (data?.get("reactivatedFromDeletion") as? Boolean == true) {
