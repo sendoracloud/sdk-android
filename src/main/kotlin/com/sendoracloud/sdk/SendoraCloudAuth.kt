@@ -15,6 +15,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
+import java.util.Base64
 import kotlin.random.Random
 
 /**
@@ -348,6 +349,22 @@ class SendoraCloudAuth internal constructor(
 ) {
     @Volatile private var cachedUser: SendoraCloudAuthUser? = null
     @Volatile private var cachedExpiresAt: Long = 0L
+    /**
+     * Set once we have PROOF the device clock runs fast: a token the server
+     * minted SECONDS AGO already reads past its own `exp`. A fresh token is
+     * never genuinely expired, so the clock we measured it with is the liar.
+     * Releases the `exp` guard for this process.
+     *
+     * ⚠ NEVER PERSIST. Re-learned for the cost of one refresh, and a stored
+     * "clock is fast" belief would outlive the correction that made it false —
+     * the same stale-frame bug this guard closes, one level up.
+     *
+     * ⚠ Without it the `exp` guard alone is a REFRESH LOOP on any clock fast by
+     * more than the token TTL: every freshly-minted token reads as already
+     * expired, so every call refreshes. Measured on the React Native reference
+     * implementation at 10 reads -> 10 refreshes.
+     */
+    @Volatile private var clockSkewConfirmed = false
     private val mutex = Mutex()
     private val refreshMutex = Mutex()
     // s58.116 — inline device-takeover listeners. UUID-keyed so
@@ -420,15 +437,90 @@ class SendoraCloudAuth internal constructor(
      * the host app reading null and triggering a fresh anonymous
      * mint on every cold launch.
      */
-    suspend fun getAccessToken(): String? = guardedValue {
+    /**
+     * The cached-token guard, and the only place the two deadlines are
+     * combined. Both must agree before a cached token is served:
+     *
+     *  1. the locally-tracked deadline (`now + expiresIn` at mint) — immune to
+     *     a constantly-wrong clock, blind to a clock that MOVES;
+     *  2. the token's own `exp` — immune to a clock that moves, wrong by the
+     *     full offset on a constantly-wrong clock.
+     *
+     * Guard 2 is released once [clockSkewConfirmed] proves which failure mode
+     * we are in.
+     *
+     * The gap this closes: `authAccessExpiresAt` is written in the device's
+     * clock frame at mint and persisted. Step the clock backwards between mint
+     * and read — automatic time landing after a long power-off, a restore, a
+     * manual set — and the deadline is stale by the size of the correction,
+     * surviving relaunches. The SDK then serves a provably dead token, every
+     * request 401s, and the app still looks signed in. Reported by Word Hurdle
+     * with a token 1929s past its `exp`.
+     */
+    private fun canServeToken(token: String?, expiresAt: Long, nowMs: Long): Boolean {
+        if (token.isNullOrEmpty() || expiresAt <= 0L) return false
+        if (nowMs >= expiresAt - refreshSafetyMs) return false
+        if (clockSkewConfirmed) return true
+        return accessTokenExpIsFuture(token, nowMs)
+    }
+
+    /** Guard 1 alone: does the locally-tracked deadline still claim life? */
+    private fun trackedDeadlineAlive(nowMs: Long): Boolean {
         val token = storage.authAccessToken
         val exp = cachedExpiresAt
+        return !token.isNullOrEmpty() && exp > 0L && nowMs < exp - refreshSafetyMs
+    }
+
+    /**
+     * True when a cached token is unusable ONLY because `exp` contradicts a
+     * tracked deadline that still claims life.
+     */
+    private fun deadlinesDisagree(nowMs: Long): Boolean =
+        trackedDeadlineAlive(nowMs) &&
+            !canServeToken(storage.authAccessToken, cachedExpiresAt, nowMs)
+
+    private fun learnClockSkewFrom(freshToken: String, nowMs: Long) {
+        if (!accessTokenExpIsFuture(freshToken, nowMs)) clockSkewConfirmed = true
+    }
+
+    /**
+     * Refresh — and when the two deadlines disagree, let the token that comes
+     * back say which one was lying.
+     *
+     * ⚠ THE TIMING IS THE MECHANISM, and the obvious placement is wrong.
+     * Probing at every mint site looks equivalent and is not: in the reported
+     * failure the token was MINTED while the clock was fast and only read after
+     * the correction, so a mint-time probe records "clock is fast" and then
+     * waves through the very token the guard exists to refuse. Probing only on
+     * a refresh performed BECAUSE `exp` contradicted a live tracked deadline
+     * separates the cases — by then the clock is either corrected (fresh token
+     * reads live, guard holds) or genuinely fast (still dead, guard releases).
+     */
+    private suspend fun refreshAndReconcile(nowMs: Long): String? {
+        val reconciling = deadlinesDisagree(nowMs)
+        val token = refreshAccessToken()
+        if (reconciling && !token.isNullOrEmpty()) {
+            learnClockSkewFrom(token, System.currentTimeMillis())
+        }
+        return token
+    }
+
+    /**
+     * @param forceRefresh skip the cache when the caller has out-of-band
+     *   evidence that the tracked deadline is wrong (it decoded `exp` itself,
+     *   or ate a 401). Does NOT bypass the refresh mutex or the backoff
+     *   cooldown, so an app that force-refreshes on every 401 cannot turn a
+     *   server outage into a hot loop against `/token/refresh`.
+     */
+    @JvmOverloads
+    suspend fun getAccessToken(forceRefresh: Boolean = false): String? = guardedValue {
         val nowMs = System.currentTimeMillis()
-        if (token != null && exp > 0 && nowMs < exp - refreshSafetyMs) return@guardedValue token
-        // Either no access token at all, or it's past (expiry - safety).
+        val token = storage.authAccessToken
+        if (!forceRefresh && canServeToken(token, cachedExpiresAt, nowMs)) return@guardedValue token
+        // Either no usable access token, or the two deadlines disagree.
         // refreshAccessToken handles both: it short-circuits when no
         // refresh token is in storage either, returning null.
-        refreshAccessToken()
+        refreshAndReconcile(nowMs)
     }
 
     /**
@@ -1367,9 +1459,11 @@ class SendoraCloudAuth internal constructor(
         val nowMs = System.currentTimeMillis()
         // Re-check after acquiring the lock; another caller may have
         // already refreshed.
-        val exp = cachedExpiresAt
+        // Same combined guard as the fast path. A bare tracked-deadline check
+        // here would hand back the very token the caller fell through to
+        // refresh, on the one path meant to REPAIR it.
         val cached = storage.authAccessToken
-        if (cached != null && exp > 0 && nowMs < exp - refreshSafetyMs) return@withLock cached
+        if (canServeToken(cached, cachedExpiresAt, nowMs)) return@withLock cached
 
         val refresh = storage.authRefreshToken ?: return@withLock null
         val response = client.post("/auth-service/token/refresh", mapOf("refreshToken" to refresh))
@@ -1649,6 +1743,9 @@ class SendoraCloudAuth internal constructor(
     private suspend fun wipeLocalIdentity(reason: WipeReason = WipeReason.REPLACED) {
         cachedUser = null
         cachedExpiresAt = 0L
+        // Drop the clock-skew finding with everything else: one refresh to
+        // re-learn, and a wipe is exactly when to inherit no beliefs.
+        clockSkewConfirmed = false
         storage.clearAuthTokens()
         stopProactiveRefreshCron()
         onAnonymousWipe()
@@ -1697,6 +1794,15 @@ class SendoraCloudAuth internal constructor(
         val nowMs = System.currentTimeMillis()
         val expMs = storage.authAccessExpiresAt
         if (expMs <= 0L) return
+        // Repair, not just anticipate. Everything below reasons from the
+        // tracked deadline, so one left stale by a backwards clock step reads
+        // as "an hour of life left" and this never fires — the SDK sits on a
+        // dead token for a full TTL while the timer ticks past it. The combined
+        // guard is the only thing here that can see that.
+        if (!canServeToken(storage.authAccessToken, expMs, nowMs)) {
+            refreshAndReconcile(nowMs)
+            return
+        }
         val remainingMs = expMs - nowMs
         if (remainingMs <= 0L) return
         val guessOriginalMs = maxOf(remainingMs, 5L * 60_000L)
@@ -1747,4 +1853,50 @@ class SendoraCloudAuth internal constructor(
             lifecycleObserver = null
         }
     }
+}
+
+
+// MARK: access-token expiry
+
+/**
+ * True when the token's OWN `exp` claim is still in the future by the device
+ * clock — or when the token carries no readable `exp` at all.
+ *
+ * ⚠ Unreadable → `true` is deliberate, and it is what makes this safe to layer
+ * UNDER the tracked-deadline check rather than in place of it. An opaque or
+ * non-JWT access token keeps exactly the behaviour it had before this guard
+ * existed; the pair can only ever refresh earlier, never later.
+ *
+ * ⚠ Never derive the tracked deadline FROM `exp`. The two guards fail in
+ * opposite directions and that is the point — `now + expiresIn` is
+ * skew-INVARIANT (a permanently wrong clock cancels on both sides) and blind to
+ * a clock that MOVES, while `exp` is written in the server's frame and survives
+ * a clock step but is wrong by the full offset on a permanently wrong clock.
+ * Collapsing them leaves one failure mode instead of two that cover each other.
+ */
+internal fun accessTokenExpIsFuture(token: String, nowMs: Long): Boolean {
+    val exp = decodeJwtExp(token) ?: return true
+    return nowMs < exp * 1000.0
+}
+
+/**
+ * Read `exp` out of a JWT payload. The signature is never verified
+ * client-side — the server is the only authority on validity; this is a
+ * freshness hint, not an authorization decision.
+ */
+internal fun decodeJwtExp(token: String): Double? = try {
+    val parts = token.split(".")
+    if (parts.size != 3) {
+        null
+    } else {
+        val json = JSONObject(String(Base64.getUrlDecoder().decode(parts[1]), Charsets.UTF_8))
+        if (json.has("exp")) {
+            val exp = json.getDouble("exp")
+            if (exp.isFinite()) exp else null
+        } else {
+            null
+        }
+    }
+} catch (_: Exception) {
+    null
 }

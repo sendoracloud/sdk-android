@@ -1,5 +1,45 @@
 # Changelog
 
+## 4.19.0 — getAccessToken() no longer returns a token past its own `exp`
+
+Parity: RN 1.34.0 / web 3.18.0 / iOS 4.19.0 / Android 4.19.0. Customer-reported
+(Word Hurdle) against the React Native SDK; all four shared the defect.
+
+**Fixed (HIGH — silent, up to a full token TTL).** `getAccessToken()` promises
+it never returns a token past its `exp`, but enforced a different value: a
+deadline computed as `now + expiresIn` at mint, persisted, restored verbatim.
+That deadline is deliberately **skew-invariant** — a permanently wrong clock
+cancels on both sides, because it is written in the same frame it is read in —
+but blind to a clock that **moves**. Corrected clock after a long power-off, a
+restore, or a manual set, and the tracked deadline is stale by exactly the size
+of the correction, across relaunches. Observed on a physical device with a token
+**1929 seconds past its `exp`**: every request 401'd while the app still looked
+signed in.
+
+The token's own `exp` is now required as well. **Requiring it alone would have
+been worse than the bug** — a clock fast by more than the token TTL reads every
+freshly-minted token as already expired, so every call refreshes, forever
+(measured at 10 reads → 10 refreshes). A one-shot probe bounds it: when a
+refresh performed *because* the two deadlines disagreed returns a token that
+STILL reads expired, the clock is proven fast rather than the deadline stale,
+and the guard is released for that process. Never persisted.
+
+Also fixed: the post-lock re-check inside the refresh path applied no `exp`
+check, on the one path meant to repair an expired token; and the
+proactive-refresh cron reasoned only from the stale deadline, so it never fired
+during the window.
+
+**Added — `getAccessToken(forceRefresh = true)`.** The supported way to say "your tracked deadline is wrong".
+Skips the cache but not the single-flight or the backoff cooldown, so
+force-refreshing on every 401 cannot turn an outage into a hot loop.
+
+`storagePrefix` is deliberately NOT part of this release for Android:
+EncryptedSharedPreferences is already scoped per application id, so a debug
+variant with an `applicationIdSuffix` is isolated by construction. The React
+Native and web SDKs, where one JS bundle can point at two projects, get the
+option.
+
+
 ## 4.13.0 — response parsing fixed (auth now works end-to-end)
 
 **Fixed (blocking).** `ApiClient` converted only the top level of a response
