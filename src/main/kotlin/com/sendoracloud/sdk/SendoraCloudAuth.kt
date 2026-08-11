@@ -15,6 +15,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
+import java.net.URLEncoder
 import java.util.Base64
 import kotlin.random.Random
 
@@ -123,6 +124,13 @@ enum class SendoraCloudAuthErrorKind {
     INVALID_CREDENTIAL,
     ACCOUNT_LOCKED,
     CREDENTIAL_IN_USE,
+
+    /**
+     * Refusing to unlink the ONLY way into this account (409). The account
+     * would still exist and still hold the user's data with nothing able to
+     * authenticate into it — permanent lockout. Add another credential first.
+     */
+    LAST_CREDENTIAL,
     ALREADY_IDENTIFIED,
     CANCELLED,
     CONFIG,
@@ -146,6 +154,7 @@ enum class SendoraCloudAuthErrorKind {
                 "RATE_LIMITED", "RATE_LIMIT", "RATE_LIMIT_EXCEEDED", "QUOTA_EXCEEDED" -> return RATE_LIMITED
                 "ACCOUNT_LOCKED" -> return ACCOUNT_LOCKED
                 "CREDENTIAL_IN_USE" -> return CREDENTIAL_IN_USE
+                "LAST_CREDENTIAL" -> return LAST_CREDENTIAL
                 "NOT_ANONYMOUS", "FORBIDDEN_NON_ANONYMOUS" -> return ALREADY_IDENTIFIED
                 "PASSKEY_USER_CANCELLED", "GAME_CENTER_CANCELLED",
                 "PLAY_GAMES_CANCELLED", "SSO_CANCELLED" -> return CANCELLED
@@ -1240,6 +1249,18 @@ class SendoraCloudAuth internal constructor(
         val hasPassword: Boolean,
     )
 
+/**
+ * Result of [SendoraCloudAuth.unlink].
+ *
+ * `removed` can exceed 1: an account may hold more than one row for a provider
+ * (distinct provider user ids across projects), and unlinking takes all of them.
+ */
+data class UnlinkResult(
+    val provider: String,
+    val removed: Int,
+    val remaining: Int,
+)
+
     /**
      * List the auth methods/identities linked to the current account (ADR-030
      * read side, s58.270): every social/gaming identity plus a [hasPassword]
@@ -1271,6 +1292,49 @@ class SendoraCloudAuth internal constructor(
         }
         val hasPassword = data["hasPassword"] as? Boolean ?: false
         Result.success(LinkedIdentitiesResult(identities = identities, hasPassword = hasPassword))
+    }
+
+    /**
+     * Remove one linked provider from the signed-in account — what a
+     * "Disconnect" button beside each entry on a Connected Accounts screen
+     * calls. The write half of [listLinkedIdentities].
+     *
+     * ⚠ The server REFUSES to remove the last way into the account, with code
+     * `LAST_CREDENTIAL` / kind [SendoraCloudAuthErrorKind.LAST_CREDENTIAL]. An
+     * account with no credentials still exists and still holds the user's data,
+     * but nothing can ever authenticate into it again — permanent lockout, not
+     * an inconvenience. A password counts as a credential.
+     *
+     * Prefer preventing the tap to explaining the refusal: read
+     * [listLinkedIdentities] and disable Disconnect when
+     * `identities.size + (if (hasPassword) 1 else 0) <= 1`. The error is the
+     * backstop, not the UX.
+     *
+     * Fails with [SendoraCloudAuthError.Unauthorized] when signed out, and with
+     * the server's `NOT_FOUND` when the provider is not linked — an absent
+     * provider is NOT reported as a successful removal, because a screen saying
+     * "disconnected" about a credential that is still attached tells the user
+     * something untrue about their account.
+     */
+    suspend fun unlink(provider: String): Result<UnlinkResult> = serialize {
+        val token = getAccessToken()
+            ?: return@serialize Result.failure(SendoraCloudAuthError.Unauthorized("Sign in before unlinking an identity"))
+        val headers = mapOf("Authorization" to "Bearer $token")
+        val escaped = URLEncoder.encode(provider, "UTF-8")
+        val response = client.delete("/auth-service/me/identities/$escaped", headers)
+            ?: return@serialize Result.failure(SendoraCloudAuthError.Network("unlink failed (network error)"))
+        val err = parseError(response)
+        if (err != null) return@serialize Result.failure(err)
+        @Suppress("UNCHECKED_CAST")
+        val data = response["data"] as? Map<String, Any?>
+            ?: return@serialize Result.failure(SendoraCloudAuthError.Unknown("Malformed unlink response"))
+        Result.success(
+            UnlinkResult(
+                provider = data["provider"] as? String ?: provider,
+                removed = (data["removed"] as? Number)?.toInt() ?: 0,
+                remaining = (data["remaining"] as? Number)?.toInt() ?: 0,
+            ),
+        )
     }
 
     /** Shared link executor. Resolves a fresh access token, POSTs the credential

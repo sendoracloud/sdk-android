@@ -1,5 +1,34 @@
 # Changelog
 
+## 4.20.0 — unlink(provider): remove a linked sign-in method
+
+Parity: RN 1.35.0 / web 3.19.0 / iOS 4.20.0 / Android 4.20.0. Additive.
+
+The write half of `listLinkedIdentities()`. An app could already render
+"Connected: Google · Game Center"; ``auth.unlink(provider)`` is what the Disconnect
+button beside each entry calls.
+
+**⚠ The server refuses to remove the last way into the account** — code
+`LAST_CREDENTIAL`, kind ``LAST_CREDENTIAL``. An account with no credentials still
+exists and still holds the user's data, but nothing can ever authenticate into
+it again: no password to reset, no identity to present. That is permanent
+lockout, not an inconvenience, and it is unrecoverable without manual database
+surgery. A password counts as a credential, so an account with email+password
+plus one social identity may drop the social one.
+
+Supabase enforces the same floor (`unlinkIdentity` requires >= 2 identities);
+Firebase's `unlink()` does not and will strip the last provider. We follow
+Supabase, deliberately.
+
+**Prefer preventing the tap to explaining the refusal.** Read
+`listLinkedIdentities()` and disable Disconnect when
+`identities.size + (if (hasPassword) 1 else 0) <= 1`. The error is the backstop, not the UX.
+
+An unlinked provider returns `NOT_FOUND` rather than reporting success — a
+screen saying "disconnected" about a credential that is still attached tells
+the user something untrue about their account.
+
+
 ## 4.19.0 — getAccessToken() no longer returns a token past its own `exp`
 
 Parity: RN 1.34.0 / web 3.18.0 / iOS 4.19.0 / Android 4.19.0. Customer-reported
