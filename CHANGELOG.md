@@ -1,5 +1,24 @@
 # Changelog
 
+## 4.21.0 — three methods stopped reporting failure as success
+
+⚠⚠ `ApiClient` is documented "never throws — errors log and the call returns null", so a discarded
+response was the only place a refusal could surface. `disableMfa()` is **step-up gated**: a 403
+`RECENT_AUTH_REQUIRED`, a timeout, and an open circuit breaker all reported MFA as off while TOTP
+stayed enrolled server-side. `revokeSession(id)` / `revokeAllSessions()` back a "sign out this device"
+button that reported success on a device that was never signed out.
+
+`revokeSession` and `revokeAllSessions` widen from `Unit` to `Result<Unit>`. ⚠ Kotlin lets a caller
+ignore a return value, so this is **source-compatible** — a minor, unlike the same fix on iOS, which
+had to break its completion signature.
+
+**New error kind: `SendoraCloudAuthErrorKind.RECENT_AUTH_REQUIRED`.** The credential is valid; the
+authentication behind it is too old to authorise a credential change. Not a request for new input:
+re-run a sign-in and retry the same call. It previously fell through to `INVALID_CREDENTIAL`.
+
+⚠ Android implements no passkey management, so the gated `DELETE /passkeys/:id` route has no call
+site here.
+
 ## 4.20.0 — unlink(provider): remove a linked sign-in method
 
 Parity: RN 1.35.0 / web 3.19.0 / iOS 4.20.0 / Android 4.20.0. Additive.

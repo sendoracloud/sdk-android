@@ -131,6 +131,13 @@ enum class SendoraCloudAuthErrorKind {
      * authenticate into it — permanent lockout. Add another credential first.
      */
     LAST_CREDENTIAL,
+    /**
+     * The credential is VALID; the authentication behind it is too old to
+     * authorise a credential change (403 `RECENT_AUTH_REQUIRED`). NOT a bad
+     * credential — re-run a sign-in the user already has and retry the SAME
+     * call. `details.maxAgeSeconds` is the freshness window.
+     */
+    RECENT_AUTH_REQUIRED,
     ALREADY_IDENTIFIED,
     CANCELLED,
     CONFIG,
@@ -155,6 +162,10 @@ enum class SendoraCloudAuthErrorKind {
                 "ACCOUNT_LOCKED" -> return ACCOUNT_LOCKED
                 "CREDENTIAL_IN_USE" -> return CREDENTIAL_IN_USE
                 "LAST_CREDENTIAL" -> return LAST_CREDENTIAL
+                // ⚠ A CODE arm, not a status one. The status block below maps
+                // any >= 400 to INVALID_CREDENTIAL ("needs new input"), which is
+                // the opposite of what a step-up refusal means.
+                "RECENT_AUTH_REQUIRED" -> return RECENT_AUTH_REQUIRED
                 "NOT_ANONYMOUS", "FORBIDDEN_NON_ANONYMOUS" -> return ALREADY_IDENTIFIED
                 "PASSKEY_USER_CANCELLED", "GAME_CENTER_CANCELLED",
                 "PLAY_GAMES_CANCELLED", "SSO_CANCELLED" -> return CANCELLED
@@ -1099,10 +1110,22 @@ class SendoraCloudAuth internal constructor(
         Result.success(confirmed)
     }
 
+    /**
+     * Disable MFA.
+     *
+     * ⚠ STEP-UP gated (s58.319): a token whose `auth_time` is stale is refused
+     * with 403 `RECENT_AUTH_REQUIRED` ([SendoraCloudAuthErrorKind.RECENT_AUTH_REQUIRED]).
+     *
+     * ⚠ The response used to be DISCARDED, and `ApiClient` is documented "never
+     * throws — errors log and the call returns null", so that refusal, a
+     * timeout, and an open circuit breaker all reported MFA as off while TOTP
+     * stayed enrolled server-side.
+     */
     suspend fun disableMfa(): Result<Unit> = guardedResult {
         val headers = bearerHeaders()
             ?: return@guardedResult Result.failure(SendoraCloudAuthError.Unauthorized("Not signed in"))
-        client.post("/auth-service/mfa/disable", emptyMap(), headers)
+        val response = client.post("/auth-service/mfa/disable", emptyMap(), headers)
+        parseError(response)?.let { return@guardedResult Result.failure(it) }
         Result.success(Unit)
     }
 
@@ -1132,16 +1155,31 @@ class SendoraCloudAuth internal constructor(
         }
     }
 
-    suspend fun revokeSession(sessionId: String) = guardedValue {
-        val headers = bearerHeaders() ?: return@guardedValue
-        client.delete("/auth-service/sessions/me/$sessionId", headers)
-        Unit
+    /**
+     * Revoke one of the caller's own sessions ("sign out that device").
+     *
+     * ⚠ Widened `Unit` -> `Result<Unit>` in 4.21.0. Kotlin lets a caller ignore
+     * a return value, so this is source-compatible — a MINOR, unlike the same
+     * fix on iOS. It previously discarded the response entirely: a "sign out
+     * this device" button that reports success on a failure is the one place a
+     * user acts on the claim and then stops worrying about a device they no
+     * longer control.
+     */
+    suspend fun revokeSession(sessionId: String): Result<Unit> = guardedResult {
+        val headers = bearerHeaders()
+            ?: return@guardedResult Result.failure(SendoraCloudAuthError.Unauthorized("Not signed in"))
+        val response = client.delete("/auth-service/sessions/me/$sessionId", headers)
+        parseError(response)?.let { return@guardedResult Result.failure(it) }
+        Result.success(Unit)
     }
 
-    suspend fun revokeAllSessions() = guardedValue {
-        val headers = bearerHeaders() ?: return@guardedValue
-        client.delete("/auth-service/sessions/me", headers)
-        Unit
+    /** Revoke every session for the caller. Same 4.21.0 change as [revokeSession]. */
+    suspend fun revokeAllSessions(): Result<Unit> = guardedResult {
+        val headers = bearerHeaders()
+            ?: return@guardedResult Result.failure(SendoraCloudAuthError.Unauthorized("Not signed in"))
+        val response = client.delete("/auth-service/sessions/me", headers)
+        parseError(response)?.let { return@guardedResult Result.failure(it) }
+        Result.success(Unit)
     }
 
     /**
