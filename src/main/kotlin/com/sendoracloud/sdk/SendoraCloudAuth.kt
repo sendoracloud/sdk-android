@@ -365,7 +365,10 @@ class SendoraCloudAuth internal constructor(
     private val client: ApiClient,
     private val storage: Storage,
     private val onIdentityChange: (String?) -> Unit,
-    private val onAnonymousWipe: suspend () -> Unit,
+    // Boolean = rotateDeviceId: true only at a person-boundary (explicit signOut /
+    // account deletion), so the anonymous id survives a sign-in/upgrade (SudokuHurdle
+    // r6; parity with RN 1.38.0 / web 3.22.0).
+    private val onAnonymousWipe: suspend (Boolean) -> Unit,
 ) {
     @Volatile private var cachedUser: SendoraCloudAuthUser? = null
     @Volatile private var cachedExpiresAt: Long = 0L
@@ -1850,7 +1853,7 @@ data class UnlinkResult(
         clockSkewConfirmed = false
         storage.clearAuthTokens()
         stopProactiveRefreshCron()
-        onAnonymousWipe()
+        onAnonymousWipe(reason == WipeReason.USER || reason == WipeReason.ACCOUNT_DELETED)
         when (reason) {
             WipeReason.REPLACED -> Unit
             WipeReason.USER -> emitAuthState(AuthStateChange.SignedOut(AuthSignedOutReason.USER))

@@ -28,6 +28,15 @@ android {
     }
 }
 
+// Dependency locking (s58.346) — writes gradle.lockfile so osv-scanner can
+// resolve pinned transitive versions and flag CVEs in the Android deps. All
+// direct versions are exact-pinned, so the resolved graph is deterministic and
+// JitPack resolves the same versions from the same repos. Regenerate on any dep
+// change: `ANDROID_HOME=~/Library/Android/sdk ./gradlew dependencies --write-locks`.
+dependencyLocking {
+    lockAllConfigurations()
+}
+
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.lifecycle:lifecycle-process:2.8.0")
@@ -64,7 +73,7 @@ afterEvaluate {
                 groupId = "com.sendoracloud"
                 artifactId = "sdk-android"
                 // Keep in lockstep with internal/SdkVersion.kt SDK_VERSION (ADR-023 §7).
-                version = "4.21.0"
+                version = "4.23.0"
                 pom {
                     name.set("Sendora Cloud Android SDK")
                     description.set("Deep linking, attribution, and event tracking for Android.")

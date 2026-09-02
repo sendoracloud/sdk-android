@@ -37,7 +37,6 @@ object SendoraCloud {
     private var storage: Storage? = null
     private var eventQueue: EventQueue? = null
     private var deviceContext: DeviceContext? = null
-    private var fingerprintHash: String? = null
     private var appContext: Context? = null
     private var currentUserId: String? = null
     private var currentIdentityToken: String? = null
@@ -131,7 +130,11 @@ object SendoraCloud {
 
         val device = DeviceContext.collect(appContext)
         deviceContext = device
-        fingerprintHash = FingerprintGenerator.generate(device)
+        // ⚠ No device fingerprint is computed. Apple prohibits deriving a device
+        // identifier from device signals for attribution (this SDK used to compute
+        // and auto-transmit sha256(model|osVersion|screen|locale|timezone) on first
+        // launch); attribution rides deterministic signals only (deviceId; the Play
+        // Install Referrer). Kept in lockstep with iOS. See the 4.x CLAUDE note.
 
         val client = ApiClient(finalConfig.apiBaseUrl, finalConfig.apiKey, finalConfig.pinnedSPKIHashes)
         apiClient = client
@@ -154,21 +157,26 @@ object SendoraCloud {
                 currentUserId = userId
                 store.cachedUserId = userId
             },
-            onAnonymousWipe = {
-                // Switching identities — rotate device-side state so
-                // events from the new user can't carry over the prior
-                // anonymous attribution. Also drain the event queue:
-                // pending events were captured under the prior
-                // currentUserId and shouldn't surface under the next.
+            onAnonymousWipe = { rotateDeviceId ->
+                // Clear the user identity on every wipe. The device (anonymous
+                // analytics) id rotates ONLY at a person-boundary — an explicit
+                // signOut or account deletion (rotateDeviceId=true). On a
+                // sign-in/upgrade or an involuntary session death it SURVIVES:
+                // same person, so pre-auth analytics link to the now-real user
+                // (parity with RN 1.38.0; the industry norm — Segment/Amplitude/
+                // Mixpanel/RevenueCat/Firebase). Rotating on logout keeps two
+                // people on a shared device from merging.
                 currentUserId = null
                 currentIdentityToken = null
                 store.cachedUserId = null
-                store.regenerateDeviceId()
-                // Force-mint a fresh device id immediately so any
-                // concurrent track() that races the wipe sees the
-                // new id rather than a transiently missing one.
-                @Suppress("UNUSED_VARIABLE")
-                val _force = store.deviceId
+                if (rotateDeviceId) {
+                    store.regenerateDeviceId()
+                    // Force-mint a fresh device id immediately so any concurrent
+                    // track() that races the wipe sees the new id rather than a
+                    // transiently missing one.
+                    @Suppress("UNUSED_VARIABLE")
+                    val _force = store.deviceId
+                }
                 store.sessionId = UUID.randomUUID().toString()
                 eventQueue?.dropAll()
             },
@@ -272,7 +280,9 @@ object SendoraCloud {
 
     /**
      * Legacy / attribution-only deferred-deeplink path: posts to
-     * `/attribution/deferred` using the 16-hex `FingerprintGenerator` hash.
+     * `/attribution/deferred` with the deviceId only — the device fingerprint it
+     * once sent was removed (no on-device fingerprinting, per Apple's rule; kept in
+     * lockstep with iOS), so this path no longer matches on a fingerprint.
      * For Branch-parity deferred matching prefer
      * `SendoraCloud.links?.matchDeferred(...)`, which hits `/sdk/links/match`
      * with the 64-hex canonical `computeDeviceFingerprint`. The two paths use
@@ -288,7 +298,6 @@ object SendoraCloud {
         }
         scope.launch {
             val body = mutableMapOf<String, Any?>("projectId" to cfg.projectId)
-            fingerprintHash?.let { body["fingerprintHash"] = it }
             body["deviceId"] = store.deviceId
             val response = client.post("/attribution/deferred", body)
             val data = (response?.get("data") as? Map<*, *>)
@@ -478,10 +487,12 @@ object SendoraCloud {
         val cfg = config ?: return
         store.isFirstLaunch = false
 
+        // No fingerprintHash — the auto install report carries deterministic
+        // signals only (see the compliance note at init). This is the silent-default
+        // removal (parity with iOS).
         val baseBody = mutableMapOf<String, Any?>(
             "projectId" to cfg.projectId,
             "deviceId" to store.deviceId,
-            "fingerprintHash" to (fingerprintHash ?: ""),
             "appVersion" to (deviceContext?.appVersion ?: ""),
             "os" to "Android",
             "osVersion" to (deviceContext?.osVersion ?: ""),

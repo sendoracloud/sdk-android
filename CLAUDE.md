@@ -6,6 +6,29 @@ Published at `github.com/sendoracloud/sdk-android`, consumed via JitPack (`com.g
 
 
 
+## ⚠ Dependency locking — `gradle.lockfile` (s58.346)
+
+`build.gradle.kts` enables `dependencyLocking { lockAllConfigurations() }` and a
+committed `gradle.lockfile` pins every resolved transitive version. Reason: it's
+the ONLY artifact `osv-scanner` can read to CVE-scan the Android deps (it can't
+resolve versions from `build.gradle.kts` alone). First scan (s58.346): 100
+packages, **0 issues**.
+
+⚠ **Regenerate on ANY dependency change**, or the build fails against the stale
+lock (that failure is the point — it forces a conscious re-lock):
+
+```bash
+ANDROID_HOME=~/Library/Android/sdk ./gradlew dependencies --write-locks --no-daemon
+```
+
+⚠ **The lockfile is enforced on the JitPack path too** — the mirror sync carries
+it (it's at the module root, not under `build/`), so `:publishToMavenLocal` (what
+JitPack runs) validates against it. Safe because every direct version is
+exact-pinned → deterministic resolution from google()/mavenCentral() under the
+committed 8.2 wrapper. Verified both `testDebugUnitTest` and `:publishToMavenLocal`
+green with the lock active before it landed. If a dep bump ever makes JitPack
+resolve a different transitive, re-lock locally first and commit the new lockfile.
+
 ## ⚠ The version lives in TWO files — keep them in lockstep
 
 `build.gradle.kts` (`version = "..."`) **and**
@@ -18,6 +41,35 @@ announces the OLD version in its `X-Sendora-SDK-Version` header while published
 under the new one — which corrupts every version-correlated support question
 without ever failing a build. It caught exactly this on the 4.18.0 bump.
 
+
+## 4.23.0 — no device fingerprinting (parity with iOS 5.2.0, SudokuHurdle)
+
+**Removed the capability.** `FingerprintGenerator` is **deleted**; the SDK no longer
+computes or transmits a device fingerprint. Same fix + rationale as iOS 5.2.0 (see
+there): `init()` (default `autoStartAttribution = true`) used to compute + auto-POST a
+device-signal hash to `/attribution/install` on first launch. The auto install report
+now carries deterministic signals only (`deviceId`/`appVersion`/`os`/`osVersion`);
+`/attribution/deferred` drops the fingerprint. `autoStartAttribution` stays `true`
+(it also gates session-start tracking). Less policy-critical off-Apple than iOS, but
+kept in lockstep. ADR-023 safe (removed a body field the backend treats as optional).
+`./gradlew :compileReleaseKotlin` BUILD SUCCESSFUL. Version bumped in BOTH files (4.23.0).
+
+## 4.22.0 — deviceId survives identify/upgrade (SudokuHurdle r6)
+
+Parity with RN 1.38.0 (full write-up there). The device (anonymous analytics) id
+rotated on EVERY auth transition — including the anon→identified upgrade where the
+server preserves the `sub`. It now survives identify/upgrade and rotates only at a
+person-boundary. `onAnonymousWipe` gained a `Boolean` (rotateDeviceId);
+`wipeLocalIdentity` passes `reason == WipeReason.USER || reason == WipeReason.ACCOUNT_DELETED`,
+so `REPLACED` (sign-in/upgrade) and `SESSION_EXPIRED` clear the userId but KEEP the
+`device_id` (same person → pre-auth analytics link to them), while an explicit
+`signOut()` and the public `reset()` still rotate it (shared-device isolation:
+`coalesce(user_id, anonymous_id)` makes the anon id the identity only while signed
+out). ADR-023 safe: the `device_id` EncryptedSharedPreferences key is unchanged, only
+the value's regeneration frequency drops. Alias/merge stays server-authoritative
+(`prevAnonRefreshToken` → `user_upgraded`/`user_merged`). `./gradlew
+:compileReleaseKotlin` BUILD SUCCESSFUL. Version bumped in BOTH `build.gradle.kts` +
+`SdkVersion.kt` (4.22.0).
 
 ## 4.18.0 — getLastAnonRetirement(): did my guest account survive? (s58.278)
 
