@@ -42,6 +42,29 @@ under the new one — which corrupts every version-correlated support question
 without ever failing a build. It caught exactly this on the 4.18.0 bump.
 
 
+## 4.24.0 — event-queue coroutine hardening + foreground flush (Word Hurdle audit)
+
+Found during the RN 1.39.0 cross-SDK audit (RopoLabs reported RN leaking an unhandled
+rejection on slow `/api/v1/events`). Android was **not** affected by that bug — its
+`ApiClient` returns `null` on timeout/IOException (never throws), `performFlush` wraps
+the handler, and the outer `SendoraCloud` scope carries a `CoroutineExceptionHandler`.
+Two defence-in-depth / parity gaps closed:
+
+- **Internal `EventQueue` scope now carries a `CoroutineExceptionHandler`** (it had only
+  `Dispatchers.IO + SupervisorJob()`, unlike the outer scope). Dormant today — every
+  throw point upstream is already caught — but if an unforeseen throw ever reached a
+  `scope.launch` here it would hit the app's default handler and crash. Now it logs.
+- **Foreground flush.** `ProcessLifecycleOwner` `onStart` now `scope.launch {
+  eventQueue?.flush() }` — parity with RN 1.39.0 + iOS. Before, the queue flushed only
+  on the 30 s timer, the size threshold, and consent-grant; returning to foreground (when
+  the network is most likely back) is the natural moment to deliver a backlog banked while
+  offline. Timer/threshold flushes are unchanged.
+
+Additive; no frozen SharedPreferences key/header/route/wire shape touched (ADR-023), no
+public signature changed. Version bumped in BOTH `build.gradle.kts` + `SdkVersion.kt`
+(4.24.0). ⚠ Not yet mirror-published — the JitPack tag + on-device smoke are the
+operator step (as with every native release).
+
 ## 4.23.0 — no device fingerprinting (parity with iOS 5.2.0, SudokuHurdle)
 
 **Removed the capability.** `FingerprintGenerator` is **deleted**; the SDK no longer

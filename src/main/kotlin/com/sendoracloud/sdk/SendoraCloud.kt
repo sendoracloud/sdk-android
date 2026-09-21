@@ -244,6 +244,11 @@ object SendoraCloud {
                         ))
                     }
                     if (finalConfig.autoTrackEngagement) engResume()
+                    // Returning to foreground is when the network is most likely
+                    // back — drain any events banked while backgrounded/offline
+                    // (4.24.0, parity with RN 1.39.0 + iOS). Timer/threshold flushes
+                    // still run; this just delivers sooner on resume.
+                    scope.launch { eventQueue?.flush() }
                 }
             })
         }

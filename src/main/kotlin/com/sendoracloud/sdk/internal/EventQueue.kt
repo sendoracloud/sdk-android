@@ -27,7 +27,16 @@ internal class EventQueue(
      * itself runs OUTSIDE the lock so `add()` is never blocked on I/O.
      */
     private var isFlushing = false
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    // ⚠ Carries a CoroutineExceptionHandler like the outer SendoraCloud scope does
+    // (4.24.0). Every throw point in the flush chain is already caught upstream
+    // (ApiClient returns null on timeout/IOException; performFlush wraps the handler),
+    // so this is defence-in-depth: an unforeseen throw in a `scope.launch` here logs
+    // instead of reaching the app's default uncaught-exception handler and crashing.
+    private val scope = CoroutineScope(
+        Dispatchers.IO + SupervisorJob() + CoroutineExceptionHandler { _, e ->
+            SendoraCloudLogger.error("Event-queue coroutine error", e)
+        },
+    )
 
     init {
         // Load persisted events
