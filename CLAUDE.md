@@ -42,6 +42,20 @@ under the new one — which corrupts every version-correlated support question
 without ever failing a build. It caught exactly this on the 4.18.0 bump.
 
 
+## 4.25.0 — signInAnonymously() over an identified session is a no-op (RopoLabs A2, parity RN 1.40.0)
+
+Full write-up in the RN CLAUDE.md 1.40.0 section. The reuse guard in
+`SendoraCloudAuth.kt` `signInAnonymously` was `existing?.isAnonymous == true &&
+storage.authRefreshToken != null`, so over a LIVE ACCOUNT session it fell through, minted
+a guest and persisted over the account's tokens with no state event. Now `existing != null
+&& storage.authRefreshToken != null`: an identified session is returned as-is; `forceNew =
+true` is the single explicit replace. All four SDKs carried the identical guard and ship
+the fix in lockstep (RN 1.40.0 / web 3.23.0 / iOS 5.3.0). Version bumped in BOTH files
+(4.25.0). ⚠ The 4.14.0 note says the reuse guard "is pinned by source assertions" — that
+pin (if it asserts the `isAnonymous == true` text) must move with the guard; see the test
+run in STATUS s58.355. ⚠ Not yet mirror-published — JitPack tag + on-device smoke are the
+operator step.
+
 ## 4.24.0 — event-queue coroutine hardening + foreground flush (Word Hurdle audit)
 
 Found during the RN 1.39.0 cross-SDK audit (RopoLabs reported RN leaking an unhandled

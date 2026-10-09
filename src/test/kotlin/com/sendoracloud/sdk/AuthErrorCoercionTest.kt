@@ -114,7 +114,10 @@ class AuthErrorCoercionTest {
         )
         assertTrue(
             "reuse requires BOTH a cached anonymous user and a refresh token on disk",
-            source.contains("if (!forceNew && existing?.isAnonymous == true && storage.authRefreshToken != null)"),
+            // 4.25.0: the guard covers an IDENTIFIED session too (RopoLabs A2) —
+            // `existing != null`, not `existing?.isAnonymous == true`. Pinning the
+            // old text would re-admit the account-overwrite this release removes.
+            source.contains("if (!forceNew && existing != null && storage.authRefreshToken != null)"),
         )
         assertTrue(
             "the reuse path returns without a network call",

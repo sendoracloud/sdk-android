@@ -563,8 +563,20 @@ class SendoraCloudAuth internal constructor(
      * token there is nothing left to authenticate with, so that account is
      * already unreachable and minting is the only way forward.
      *
-     * Pass `forceNew = true` to deliberately abandon the current anonymous
-     * session and mint a separate one.
+     * ⚠ Returns the CURRENT session when one exists — anonymous OR identified
+     * (4.25.0). The guard used to be `existing.isAnonymous`, so a plain
+     * `signInAnonymously()` over a live account session fell through, minted a
+     * guest and overwrote the account's tokens locally with no state event
+     * (this path never wipes; it persists over the top). The account survives
+     * server-side, recoverable by its credential, but the device became a
+     * stranger to it. Returning the identified session is a no-op for a
+     * defensive caller and the honest answer to "make sure I have a session";
+     * read `isAnonymous` to know which kind you got. Reported by RopoLabs on
+     * the RN SDK; same code here.
+     *
+     * Pass `forceNew = true` to deliberately abandon the current session —
+     * whichever kind — and mint a separate anonymous one. That is the only way
+     * this replaces an identified session, and it does so silently.
      */
     suspend fun signInAnonymously(
         name: String? = null,
@@ -577,7 +589,7 @@ class SendoraCloudAuth internal constructor(
             ))
         }
         val existing = cachedUser
-        if (!forceNew && existing?.isAnonymous == true && storage.authRefreshToken != null) {
+        if (!forceNew && existing != null && storage.authRefreshToken != null) {
             return@serialize Result.success(existing)
         }
         val body = mutableMapOf<String, Any?>()

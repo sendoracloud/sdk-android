@@ -1,5 +1,16 @@
 # Changelog
 
+## 4.25.0 — signInAnonymously() no longer replaces a signed-in account
+
+**Behaviour change.** Parity with RN 1.40.0 (reported by RopoLabs on the RN SDK; the
+guard here was identical). `signInAnonymously(forceNew = …)` reused an existing *anonymous*
+session but fell through when the cached session was an identified account: it minted a
+guest and persisted over the account's tokens with no `SignedOut` on `onAuthStateChanged`.
+It now returns the current session whatever its kind; `forceNew = true` is the only way to
+replace an identified session, and it does so silently. Read `isAnonymous` to know which
+you got. The account itself was never at risk server-side. Same fix in web 3.23.0 / iOS
+5.3.0. Version bumped in BOTH `build.gradle.kts` + `SdkVersion.kt`.
+
 ## 4.21.0 — three methods stopped reporting failure as success
 
 ⚠⚠ `ApiClient` is documented "never throws — errors log and the call returns null", so a discarded
