@@ -757,13 +757,17 @@ class AuthMachineConformanceTest {
         },
         "refresh_dead.current" to {
             runBlocking {
-                for ((endReason, expected) in listOf("revoked" to AuthSignedOutReason.REVOKED, "deleted" to AuthSignedOutReason.DELETED, "expired" to AuthSignedOutReason.SESSION_EXPIRED, null to AuthSignedOutReason.SESSION_EXPIRED)) {
+                // 4.26.1: `reason` is SESSION_EXPIRED for EVERY dead verdict (4.25.0's value — a listener
+                // matching it must still see "deleted elsewhere" / "revoked"); the server's detail is the
+                // separate `endReason`, null iff the server sent none.
+                for ((endReason, expected) in listOf("revoked" to AuthSignedOutReason.SESSION_EXPIRED, "deleted" to AuthSignedOutReason.SESSION_EXPIRED, "evicted" to AuthSignedOutReason.SESSION_EXPIRED, "expired" to AuthSignedOutReason.SESSION_EXPIRED, "reuse" to AuthSignedOutReason.SESSION_EXPIRED, "unknown" to AuthSignedOutReason.SESSION_EXPIRED, null to AuthSignedOutReason.SESSION_EXPIRED)) {
                     val rig = anonymousRig()
                     rig.transport.enqueue("/auth-service/token/refresh", deadRefresh(endReason))
                     assertNull(rig.auth.getAccessToken(forceRefresh = true))
                     assertEquals(AuthStatus.SIGNED_OUT, rig.auth.status())
                     assertEquals(listOf("signed_out"), rig.eventNames)
                     assertEquals("endReason=$endReason", expected, (rig.events.single() as AuthStateChange.SignedOut).reason)
+                    assertEquals("SignedOut.endReason carries the server's verdict", endReason, (rig.events.single() as AuthStateChange.SignedOut).endReason)
                     assertEquals("stop the cron", 1, rig.cron.disarms)
                     assertFalse("no anon-id rotation", rig.wipes.single().rotateDeviceId)
                     assertNull(rig.store.secure[AuthKeys.REFRESH]); assertNull(rig.store.secure[AuthKeys.SESSION])

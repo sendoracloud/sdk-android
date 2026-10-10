@@ -42,6 +42,18 @@ under the new one — which corrupts every version-correlated support question
 without ever failing a build. It caught exactly this on the 4.18.0 bump.
 
 
+## 4.26.1 — dead session is `SESSION_EXPIRED` again; server detail in `SignedOut.endReason: String? = null` (same shape as `GuestReleased.endReason`; `AuthTx.Clear.endReason`) (RopoLabs, 2026-10-10)
+
+4.26.0 mapped the B11 `endReason` onto `signed_out.reason` (`revoked` / `deleted`). Those are two
+OLD situations ("account deleted elsewhere", "sessions revoked") that 4.25.0 reported as
+`SESSION_EXPIRED`, so a listener matching `SESSION_EXPIRED` stopped seeing them — RopoLabs' template
+(`auth-store.ts:665`) and our own `/docs/auth-errors` example both did. ⚠ **A new union value is
+additive only for a NEW situation; re-labelling an existing one is a behaviour change**
+(ADR-023), even though it compiles. Fix: `reason` is `SESSION_EXPIRED` for EVERY dead verdict; the
+detail is `SignedOut.endReason: String? = null` (same shape as `GuestReleased.endReason`; `AuthTx.Clear.endReason`). The three values stay in the type (never emitted) so 1.41.0-era code compiles.
+Shared table row `refresh_dead.current` now emits `signed_out{reason:'session_expired', endReason}`.
+Guard `AuthMachineConformanceTest` `refresh_dead.current`; mutations: map revoked/deleted back onto `reason` → 1 red; drop the endReason → 1 red.
+
 ## ADR-033 wave 1 (4.26.0) — the auth state machine
 
 Lockstep with RN 1.41.0 / web 3.24.0 / iOS 5.4.0. Spec: `docs/decisions/033-sdk-auth-mechanism.md`

@@ -1,5 +1,28 @@
 # Changelog
 
+## 4.26.1 — a dead session is `SESSION_EXPIRED` again; the server's detail moves to `SignedOut.endReason`
+
+**Fix to a 4.26.0 behaviour change (ADR-023: a new value is additive only for a NEW situation).**
+A session that died on a server-rejected refresh was reported as `SESSION_EXPIRED` through
+4.25.0. 4.26.0 reported the server's own verdict as the reason instead (`REVOKED` / `DELETED`),
+which gave two old situations new names: "account deleted on another device" and "sessions
+revoked". Adding a value to a union is additive for the compiler, not for a listener that
+matched the old value. A listener that acted only on `SESSION_EXPIRED` (the documented pattern, and
+the RopoLabs template's session-death handler) silently ignored both, leaving the app on a
+signed-in screen where every request fails. Reported by RopoLabs against the published
+tarball before any production install.
+
+- `SignedOut.reason` is `SESSION_EXPIRED` for EVERY server-rejected refresh, exactly as 4.25.0.
+- New `SignedOut.endReason: String? = null` (wire value: `revoked` / `deleted` / `expired` /
+  `reuse` / `unknown`), same shape as `GuestReleased.endReason`. `null` on `USER` /
+  `ACCOUNT_DELETED` and from an older backend.
+- `REVOKED` / `EVICTED` / `DELETED` stay in `AuthSignedOutReason` so code written against 4.26.0
+  compiles; they are never emitted again.
+- Nothing else changed (storage, wipe effects, held-slot release rules).
+
+Parity: RN 1.41.1 / web 3.24.1 / iOS 5.4.1. Guard: `AuthMachineConformanceTest`
+`refresh_dead.current` (every endReason → `SESSION_EXPIRED` + the exact `endReason`).
+
 ## 4.26.0 — sign-in no longer retires the guest — it is held on the device
 
 ADR-033 wave 1, lockstep with RN 1.41.0 / web 3.24.0 / iOS 5.4.0. MINOR (ADR-023):

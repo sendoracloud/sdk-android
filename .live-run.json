@@ -1,9 +1,9 @@
 {
   "sdk": "android",
-  "sdkVersion": "4.26.0",
-  "commit": "2665de1c1c7e89b0efe37e4fe441c72ee6177dea",
+  "sdkVersion": "4.26.1",
+  "commit": "3f8f0f43dcd1e92066ecdc3afcb1a353c13b0126",
   "apiHost": "api-dev.sendoracloud.com",
-  "at": "2026-10-10T06:53:05.457Z",
+  "at": "2026-10-10T18:29:12.339Z",
   "suite": "auth-lifecycle-w1",
   "passed": true
 }

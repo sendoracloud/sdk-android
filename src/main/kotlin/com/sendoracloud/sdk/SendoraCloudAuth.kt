@@ -397,14 +397,18 @@ data class DeletionCancelledEvent(
  * `getAccessToken()` started returning null.
  *
  * - [USER]            — the app called `signOut()` (or `discardWithheld()`).
- * - [SESSION_EXPIRED] — the server rejected the stored refresh token without
- *                       a more specific verdict. Transient network failures and
- *                       rate limits do NOT produce this.
+ * - [SESSION_EXPIRED] — the server rejected the stored refresh token. EVERY
+ *                       dead verdict, whatever the server's detail: read
+ *                       [AuthStateChange.SignedOut.endReason] (`revoked` /
+ *                       `deleted` / `expired` / `reuse` / `unknown`) for that.
+ *                       Transient network failures and rate limits do NOT
+ *                       produce this.
  * - [ACCOUNT_DELETED] — `deleteAccount()` succeeded.
- * - [REVOKED] / [EVICTED] / [DELETED] — ADR-033 B11 (4.26.0, additive): the
- *   server's own `endReason` on the rejection (revoked by a credential change
- *   or sign-out elsewhere / evicted by the session cap — reserved, not emitted
- *   yet / the account row is gone). ⚠ Branch with an `else`.
+ * - [REVOKED] / [EVICTED] / [DELETED] — ⚠ emitted by 4.26.0 ONLY, never since
+ *   4.26.1. 4.26.0 put the server's `endReason` here, which renamed "account
+ *   deleted elsewhere" / "sessions revoked" (both SESSION_EXPIRED through
+ *   4.25.0) and silently broke listeners matching SESSION_EXPIRED. Kept so code
+ *   written against 4.26.0 still compiles. ⚠ Branch with an `else`.
  */
 enum class AuthSignedOutReason(val wire: String) {
     USER("user"),
@@ -429,7 +433,8 @@ sealed class AuthStateChange {
     data class SignedIn(val user: SendoraCloudAuthUser, val cause: AuthSignedInCause? = null) : AuthStateChange() {
         override val event: String get() = "signed_in"
     }
-    data class SignedOut(val reason: AuthSignedOutReason) : AuthStateChange() {
+    /** `endReason` (4.26.1) = the server's own verdict on a dead refresh token (B11 wire value); `null` on USER / ACCOUNT_DELETED and from an older backend. */
+    data class SignedOut(val reason: AuthSignedOutReason, val endReason: String? = null) : AuthStateChange() {
         override val event: String get() = "signed_out"
     }
     /** LEGACY — fires only when the server reports a retirement, which this SDK never requests. */
@@ -2407,12 +2412,14 @@ class SendoraCloudAuth internal constructor(
             val error = objectField(response["error"])
             val code = error?.get("code") as? String
             if (code != null && isDeadRefreshError(code)) {
-                // ADR-033 B11: the server's own end reason → `SignedOut.reason`.
+                // ADR-033 B11: the server's own end reason rides in `SignedOut.endReason`;
+                // `reason` is ALWAYS SESSION_EXPIRED (4.26.1 — see AuthSignedOutReason).
                 // The Clear CAS'es on the token the server rejected — a sign-in or
                 // signOut that landed meanwhile is not the session declared dead.
                 val endReason = objectField(error?.get("details"))?.get("endReason") as? String
                 commit(AuthTx.Clear(
-                    reason = signedOutReasonFor(endReason), expectRefresh = refresh, revokeToken = null,
+                    reason = AuthSignedOutReason.SESSION_EXPIRED, expectRefresh = refresh, revokeToken = null,
+                    endReason = endReason,
                     effects = AuthWipeEffects(rotateDeviceId = false, clearQueue = false, clearUserId = true),
                     stampHeldNoAutoRestore = false,
                 ))
@@ -2432,14 +2439,6 @@ class SendoraCloudAuth internal constructor(
         val user = (data["user"] as? Map<String, Any?>)?.let(AuthCodecs::userFromMap)
         val outcome = commit(AuthTx.Rotate(sent = refresh, accessToken = trio.first, refreshToken = trio.second, expiresAt = nowMs + trio.third * 1000L, user = user))
         if (outcome == RotateOutcome.APPLIED) trio.first else null
-    }
-
-    /** `expired` → SESSION_EXPIRED (unchanged); B11's verdicts pass through; `reuse`/`unknown`/absent fall back. */
-    private fun signedOutReasonFor(endReason: String?): AuthSignedOutReason = when (endReason) {
-        "revoked" -> AuthSignedOutReason.REVOKED
-        "evicted" -> AuthSignedOutReason.EVICTED
-        "deleted" -> AuthSignedOutReason.DELETED
-        else -> AuthSignedOutReason.SESSION_EXPIRED
     }
 
     /** The proactive tick (60 s + foreground): repair, anticipate, or gap-fill. Paused during an identity attempt. */
@@ -2725,6 +2724,8 @@ class SendoraCloudAuth internal constructor(
             val revokeToken: String?,
             val effects: AuthWipeEffects,
             val stampHeldNoAutoRestore: Boolean,
+            /** The server's `endReason` on a dead verdict (4.26.1) → `SignedOut.endReason`, never `reason`. */
+            val endReason: String? = null,
         ) : AuthTx()
         class UpdateUser(val user: SendoraCloudAuthUser, val cause: AuthUserUpdatedCause, val expectIdentity: String?) : AuthTx()
         class Rotate(val sent: String, val accessToken: String, val refreshToken: String, val expiresAt: Long, val user: SendoraCloudAuthUser?) : AuthTx()
@@ -2856,7 +2857,7 @@ class SendoraCloudAuth internal constructor(
             }
         }
         if (tx.effects.clearUserId || tx.effects.rotateDeviceId || tx.effects.clearQueue) onAnonymousWipe(tx.effects)
-        emitAuthState(AuthStateChange.SignedOut(tx.reason))
+        emitAuthState(AuthStateChange.SignedOut(tx.reason, tx.endReason))
         tx.revokeToken?.let { token -> background { client.post("/auth-service/token/revoke", mapOf("refreshToken" to token)) } }
         notifySettledIfNeeded()
         return true
