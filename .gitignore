@@ -11,3 +11,6 @@ build/
 .gradle/
 local.properties
 .DS_Store
+# ADR-033 B9 staging marker (scripts/e2e/auth-lifecycle.mts) — machine-local,
+# never shipped (scripts/lib/native-sdks.mjs MIRROR_NEVER_SHIP, s58.358).
+.live-run.json
