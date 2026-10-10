@@ -60,6 +60,33 @@ data class SendoraCloudConfig(
      * is no Activity/Fragment auto-instrumentation, so screen names stay clean.
      */
     val autoTrackEngagement: Boolean = true,
+    /**
+     * ADR-033 wave 1 (4.26.0) — opt-in PROJECT GUARD. When set, every session the
+     * SDK is about to install (a stored one at hydrate, a refresh result, a fresh
+     * mint / sign-in, a restored held guest) is judged by its JWT `project`
+     * claim BEFORE anything is assigned. A STORED session whose claim disagrees
+     * is not wiped and not used: `auth.status()` reports [AuthStatus.WITHHELD],
+     * every verb rejects `SESSION_WITHHELD` (kind CONFIG), and the exits are
+     * `auth.discardWithheld()` or relaunching with the matching key. A FRESH
+     * mint / sign-in that answers with the wrong project is refused with
+     * `PROJECT_MISMATCH` and its tokens revoked — the wrong-key build fails at
+     * first launch instead of poisoning a device.
+     *
+     * Must be a canonical UUID and, when [projectId] is also set, equal to it
+     * (`init` throws otherwise). Advisory — a client consistency check, not an
+     * authorization boundary. Default `null` = guard off, 4.25.0 behaviour.
+     */
+    val expectedProjectId: String? = null,
+    /**
+     * ADR-033 §8-Q1 — when `signInAnonymously()` / `ensureSession()` runs with
+     * no session and a held guest is on the device, restore the NEWEST eligible
+     * held guest instead of minting a fresh one (visible as `GuestReleased
+     * (RESTORED)` then `SignedIn(cause = RESTORE)`). `false` mints while the
+     * held-slot count is under the cap and still restores at the cap. A guest
+     * held when the then-current account was deleted is never auto-restored
+     * either way (explicit `restoreHeldGuest(id)` only).
+     */
+    val autoRestoreHeldGuest: Boolean = true,
 )
 
 /** HMAC identity-token options for `identify()`. */

@@ -42,6 +42,106 @@ under the new one — which corrupts every version-correlated support question
 without ever failing a build. It caught exactly this on the 4.18.0 bump.
 
 
+## ADR-033 wave 1 (4.26.0) — the auth state machine
+
+Lockstep with RN 1.41.0 / web 3.24.0 / iOS 5.4.0. Spec: `docs/decisions/033-sdk-auth-mechanism.md`
+§3.1–3.5, §5 wave 1, §8 defaults. The shared table (`packages/shared/src/auth-machine/`) is THE
+spec; this SDK is an interpreter of it.
+
+**Machine.** `SendoraCloudAuth` holds ONE slot (`AuthSlot` = `Empty | Session | Limbo | Withheld`)
+→ `status()` = `SIGNED_OUT | ANONYMOUS/IDENTIFIED | UNKNOWN | WITHHELD`. Every write, slot
+assignment, cron arm/disarm, emission and parent hook happens in the `commit(AuthTx.*)` arms at
+the bottom of the file (INV-1). Identity commits CAS on the `sid` family (`identityKey()`), token
+commits on the refresh token SENT (`AuthTx.Rotate.sent`); an unrouted rotation is DROPPED (P16).
+`identityAttempt {}` awaits an in-flight refresh at start AND `commitIdentity` at commit.
+Session-installing verbs `awaitSettledIfUnknown()` (queued in UNKNOWN, INV-5) and
+`rejectIfWithheld()`. Seams: `internal/AuthStore.kt` (`AuthStore` / `AuthTransport` /
+`RefreshCron`) — `Storage` / `ApiClient` / `CoroutineRefreshCron` in production, recording doubles
+in the JVM suite (`AuthMachineHarness.kt`). This is what finally lets the auth class run
+headless — no `Context`.
+
+**Storage (`internal/AuthKeys.kt` is the ONLY file naming a key).** The four frozen keys
+(format unchanged) + `auth_session` (dual-write; read-first; write-forward from legacy keys;
+`schema_version` → `"2"`) + K=5 fixed held slots `auth_held_0..4` (`{v:1,userId,sid,refreshToken,
+tokenAtHold,heldAt,project,autoRestore}`, no access token), all EncryptedSharedPreferences;
+`auth_mint_key` (B10, plain tier). ⚠ **Downgrade cycle:** a 4.25.0 signOut/deleteAccount clears
+only the frozen keys, so hydrate trusts `auth_session` ONLY when its refresh token equals the
+frozen refresh key; anything else is a leftover → `AuthTx.DropLeftoverRecord`, silently. Hence
+`writeSlot` writes the frozen keys FIRST and the record LAST (a crash can leave frozen-without-
+record, which write-forward repairs, never record-without-frozen). A hydrate of a record the SDK
+wrote itself writes NOTHING. ⚠ A held slot's `heldAt` is `max(now, newestHeld + 1)` — strictly
+increasing, or two same-millisecond holds tie and "newest" is undefined.
+
+**Guards.** `projectVerdict()` (`internal/ProjectVerdict.kt`, verbatim port, own base64url +
+strict UTF-8 decoders): absent claim = UNKNOWN, explicit null = MISMATCH. Judged in
+`commit(Install)` BEFORE assignment: hydrate mismatch → WITHHELD with ZERO writes; mint/sign-in
+mismatch → `PROJECT_MISMATCH` + fire-and-forget revoke; refresh mismatch → persist the rotated
+pair only, `SessionWithheld`; restore → `HeldGuestProjectMismatch` (slot project checked first,
+no network). `AuthMachineSets.DEAD_CODES` / `RELEASE_HELD_ON_END_REASONS` are asserted EQUAL to
+the fixture's. T = |held| + (current anonymous ? 1 : 0) ≤ K is enforced at MINT
+(`totalGuests()`), so a HOLD never displaces.
+
+**Lockstep rulings recorded here.**
+- `onAuthStateChanged` emits `Initial(status,user,withheld)` THEN the 4.25.0 `SignedIn(user)`
+  replay when a session exists (removing it is an event removal). Pinned by
+  `AuthMachineBehaviourTest` "subscribe replays Initial and then the legacy SignedIn".
+- **`SendoraCloud.reset()` is NOT an auth call on Android — case (b).** 4.25.0's `reset()` only
+  forgot the analytics identity (user id, identity token, device id, session id) and never
+  signed out, so 4.26.0 keeps exactly that. `reset(includeHeldGuests)` is accepted for parity
+  and has no effect here. The machine's RESET transaction exists as internal
+  `resetSession(includeHeldGuests)` (replayed by the conformance row `reset.keeps_held`) and is
+  deliberately not wired to the public call.
+- Restore emits `SignedIn(RESTORE)` THEN `GuestReleased(RESTORED)` on BOTH paths (explicit
+  and the MINT auto-restore) — fixture corrected in packages/shared.
+- A gap-fill that recovers an identity (UNKNOWN → session) emits the 4.12.0 `SignedIn` with no
+  cause (RN `recover` parity); `UserUpdated(REFRESH)` only when an existing user object changed.
+
+**Also fixed (pre-existing).** `getAccessToken(forceRefresh = true)` was a no-op on a token whose
+deadline still claimed life — the re-check under `refreshMutex` handed the same token back; the
+proactive anticipation tick had the same defect (it only ever refreshed in the last 30 s, via
+the repair path). `refreshAccessToken(staleToken)` now never serves the token the caller
+distrusts. UNKNOWN never serves its cached token (the call IS the gap-fill).
+
+**Tests (JVM, `./gradlew testDebugUnitTest`).** `AuthMachineConformanceTest` replays EVERY row of
+`auth-transitions.conformance.json` (36, totality both ways — a fixture row with no scenario
+fails) + every `projectVerdictCases` entry (19) through the install path it names; the fixture is
+found by walking up from `user.dir`, never copied; `emits` order is read off the row where it
+was disputed. `AuthMachineBehaviourTest` covers INV-3 across 8 sign-in verbs, signUp routing,
+B15 pending-report retry, INV-9 dedupe, B10 mint key, INV-14 bound `switchAccount`, deprecated
+`merge`/takeover, integrator test 10, the downgrade cycle, write order, heldAt ordering.
+
+**Pins converted (source text → behaviour, each with an in-file note).** All four
+`RefreshUserAdoptionTest` pins and `AuthErrorCoercionTest`'s reuse-guard + "3 raw withLock sites"
+pins. One property changed on purpose: "a live user is never overwritten by a rotation" is
+superseded by fixture row `refresh_ok.current_match` (a changed user installs +
+`UserUpdated(REFRESH)`). The CancellationException-ordering pin stays text (it measures exactly
+the ordering it names).
+
+**Mutation record (cp backup → RED → cp restore, md5-proven identical; harness kept out of
+tree).** Every §5 Android-scoped mutation turned the suite red: delete identity CAS
+(`sign_in.cas_mismatch`) · re-add `prevAnonRefreshToken` (`sign_in.switch`) · mint in unknown
+(`unknown.queue`, `refresh_dead.current`) · second `signed_in` on `link()` upgrade · drop
+`auth_session` half of dual-write (4 tests) · drop frozen-key half (4) · delete
+await-refresh-before-hold (interleaving) · link:true+identified → `/login` · revoke on
+alreadyLinked · drop switchAccount comparison · dynamic held key name (3) · `reset()` default
+wipes held · no-arg verb with 2 held · mint at T == K · dead newest slot aborts ensureSession ·
+claim without persisting rotation · release on reuse/absent (2) · auto-restore after
+account_deleted · serve the withheld token · signUp in withheld · verdict only at hydrate · skip
+verdict on refresh · absent claim = match (2) · explicit null = match · write `auth_session` in a
+withheld hydrate (3) · RESET releases held in withheld · widen DEAD_CODES at call site (2) ·
+forceRefresh re-check (2) · drop subscribe SignedIn replay · install an unrouted rotation (2) ·
+keep the stale blob · sign-in does not hold (6) · trust a leftover `auth_session` · record before
+frozen keys · `deleteAccount` discards held by default · `heldAt = now` tie. **36 / 36 red** (the first
+stale-blob mutation did not compile and was replaced by a valid one — a non-compiling mutant proves nothing).
+
+**Upgrade / downgrade experience.** 4.25.0 → 4.26.0: the four frozen keys are read, a coherent
+session is written forward into `auth_session` (one write burst at first boot), nothing else
+changes. 4.26.0 → 4.25.0: 4.25.0 reads the frozen keys (always dual-written) and ignores
+`auth_session` / `auth_held_*`; held guests are invisible to it but survive on disk for a later
+upgrade. 4.25.0 sign-out under a 4.26 record → the record is discarded on the next 4.26 boot.
+⚠ Not mirror-published; JitPack tag, on-device smoke and the B9 staging live-run are operator
+steps.
+
 ## 4.25.0 — signInAnonymously() over an identified session is a no-op (RopoLabs A2, parity RN 1.40.0)
 
 Full write-up in the RN CLAUDE.md 1.40.0 section. The reuse guard in

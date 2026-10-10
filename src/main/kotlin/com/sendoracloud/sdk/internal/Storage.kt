@@ -22,7 +22,7 @@ import java.util.UUID
  * exposed access + refresh tokens in cleartext on disk — full account
  * takeover on rooted devices or via post-uninstall data extraction.
  */
-internal class Storage(context: Context) {
+internal class Storage(context: Context) : AuthStore {
     private val prefs: SharedPreferences =
         context.getSharedPreferences("sendora_sdk", Context.MODE_PRIVATE)
 
@@ -52,7 +52,7 @@ internal class Storage(context: Context) {
 
     /** True when secure storage is available. Auth.signIn etc. should
      *  surface a configuration error to the consumer if false. */
-    val isSecureAvailable: Boolean get() = securePrefs != null
+    override val isSecureAvailable: Boolean get() = securePrefs != null
 
     /**
      * On-device schema/format-version marker (ADR-023 §5). Non-sensitive →
@@ -63,8 +63,8 @@ internal class Storage(context: Context) {
      * keys (frozen per ADR-023 §3.4).
      */
     fun ensureSchemaVersion() {
-        if (!prefs.contains("schema_version")) {
-            prefs.edit().putString("schema_version", "1").apply()
+        if (!prefs.contains(AuthKeys.SCHEMA_VERSION)) {
+            prefs.edit().putString(AuthKeys.SCHEMA_VERSION, AuthKeys.SCHEMA_VERSION_V1).apply()
         }
     }
 
@@ -132,82 +132,54 @@ internal class Storage(context: Context) {
         }
     }
 
-    // --- Auth Service tokens (EncryptedSharedPreferences ONLY) ---
+    // --- Auth Service material (EncryptedSharedPreferences ONLY) ---
+    //
+    // ADR-033 wave 1: the auth machine writes through the [AuthStore] seam
+    // below, naming keys only via [AuthKeys] (INV-1). The typed properties that
+    // follow are thin wrappers kept for the other modules (`cachedUserId` is
+    // the analytics id, not auth material, and stays above).
 
-    var authAccessToken: String?
-        get() = securePrefs?.getString("auth_access_token", null)
-        set(value) {
-            val sp = securePrefs
-            if (sp == null) {
-                SendoraCloudLogger.error("Refusing to persist auth token — secure storage unavailable")
-                return
-            }
-            val e = sp.edit()
-            if (value != null) e.putString("auth_access_token", value) else e.remove("auth_access_token")
-            e.apply()
-        }
+    override fun secureGet(key: String): String? = securePrefs?.getString(key, null)
 
-    var authRefreshToken: String?
-        get() = securePrefs?.getString("auth_refresh_token", null)
-        set(value) {
-            val sp = securePrefs
-            if (sp == null) {
-                SendoraCloudLogger.error("Refusing to persist refresh token — secure storage unavailable")
-                return
-            }
-            val e = sp.edit()
-            if (value != null) e.putString("auth_refresh_token", value) else e.remove("auth_refresh_token")
-            e.apply()
+    override fun securePut(key: String, value: String?) {
+        val sp = securePrefs
+        if (sp == null) {
+            // Fail CLOSED: never downgrade a token to the plaintext tier.
+            SendoraCloudLogger.error("Refusing to persist $key — secure storage unavailable")
+            return
         }
+        val e = sp.edit()
+        if (value != null) e.putString(key, value) else e.remove(key)
+        e.apply()
+    }
+
+    override fun secureGetLong(key: String): Long = securePrefs?.getLong(key, 0L) ?: 0L
+
+    override fun securePutLong(key: String, value: Long) {
+        val sp = securePrefs ?: return
+        val e = sp.edit()
+        if (value > 0) e.putLong(key, value) else e.remove(key)
+        e.apply()
+    }
+
+    override fun plainGet(key: String): String? = prefs.getString(key, null)
+
+    override fun plainPut(key: String, value: String?) {
+        val e = prefs.edit()
+        if (value != null) e.putString(key, value) else e.remove(key)
+        e.apply()
+    }
+
+    /** Synchronous read of the cached access token (the frozen `auth_access_token` key). */
+    val authAccessToken: String? get() = secureGet(AuthKeys.ACCESS)
+
+    val authRefreshToken: String? get() = secureGet(AuthKeys.REFRESH)
 
     /** Unix-millis when the cached access token expires. 0 = unknown. */
-    var authAccessExpiresAt: Long
-        get() = securePrefs?.getLong("auth_access_expires", 0L) ?: 0L
-        set(value) {
-            val sp = securePrefs ?: return
-            val e = sp.edit()
-            if (value > 0) e.putLong("auth_access_expires", value) else e.remove("auth_access_expires")
-            e.apply()
-        }
+    val authAccessExpiresAt: Long get() = secureGetLong(AuthKeys.EXPIRES)
 
     /** JSON-encoded `AuthUser`. Decoded by SendoraCloudAuth. */
-    var authUserJson: String?
-        get() = securePrefs?.getString("auth_user", null)
-        set(value) {
-            val sp = securePrefs
-            if (sp == null) {
-                SendoraCloudLogger.error("Refusing to persist user record — secure storage unavailable")
-                return
-            }
-            val e = sp.edit()
-            if (value != null) e.putString("auth_user", value) else e.remove("auth_user")
-            e.apply()
-        }
-
-    fun clearAuthTokens() {
-        securePrefs?.edit()
-            ?.remove("auth_access_token")
-            ?.remove("auth_access_expires")
-            ?.remove("auth_refresh_token")
-            ?.remove("auth_user")
-            ?.apply()
-    }
-
-    /**
-     * Drop the cached user record + access token but KEEP the refresh token.
-     * For the corrupt-cache path only: an unreadable `auth_user` blob (torn
-     * write, process killed mid-persist) says nothing about the refresh token,
-     * which is independently valid and is the only thing that can still recover
-     * the account — deleting it there turns a recoverable cache glitch into a
-     * permanently orphaned account for an anonymous user.
-     */
-    fun clearCachedUser() {
-        securePrefs?.edit()
-            ?.remove("auth_access_token")
-            ?.remove("auth_access_expires")
-            ?.remove("auth_user")
-            ?.apply()
-    }
+    val authUserJson: String? get() = secureGet(AuthKeys.USER)
 
     fun saveEventQueue(events: List<Map<String, Any?>>) {
         try {

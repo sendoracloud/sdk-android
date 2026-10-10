@@ -62,6 +62,84 @@ override fun onNewIntent(intent: Intent) {
 }
 ```
 
+## Auth — sign-in, link, held guests (4.26.0, ADR-033)
+
+Two verbs, one slot. **Sign-in switches; link is the only upgrade.**
+
+- `signInWith(credential)` (and every legacy `signIn` / `loginSocial` /
+  `signInWithPlayGames` / `verifyMagicLink` / `verifyEmailOtp` / `challengeMfa` /
+  passkey sign-in) is a plain SWITCH. The request carries nothing about the guest
+  on this device; if the current session was a guest it is **held on the device**
+  (`AuthStateChange.GuestHeld`), never deleted. One `SignedIn(cause = SIGN_IN)`
+  follows; there is no `SignedOut` on a replace.
+- `link(credential)` attaches a credential to the CURRENT account (same user id).
+  From a guest the account is promoted in place; over an identified account it
+  **attaches or errors — it never switches**. Collisions and stale sessions are
+  results, not exceptions:
+
+```kotlin
+val auth = SendoraCloud.auth ?: return
+when (val r = auth.link(Credential.PlayGames(serverAuthCode, playerId)).getOrThrow()) {
+    is LinkResult.Done -> if (r.alreadyLinked) Unit /* quiet, no event */ else Unit
+    is LinkResult.CredentialInUse -> {
+        // Owned by another account. Ask the player; on "switch":
+        r.switchAccount { Credential.PlayGames(fetchCodeAgain(), playerId) } // bound to the refused identity
+        // or r.keepCurrent()
+    }
+    LinkResult.RecentAuthRequired -> { /* re-authenticate with a credential already on this account */ }
+    else -> Unit
+}
+```
+
+### Held guests
+
+Up to 5 guests are held per device (`auth_held_0..4`, EncryptedSharedPreferences).
+`auth.getHeldGuests()` (newest first, no tokens), then — when you decide — one of:
+
+- `restoreHeldGuest(id)` — sign back in as that guest (no merge).
+- `discardHeldGuest(id)` — delete it for good on the server (the app is the requester).
+- `claimHeldGuest(id)` — **optional, destructive**: merge it into the current
+  identified account. Only call it if your backend acts on `auth.user_merged`.
+
+`id` may be omitted only when exactly one guest is held (`AMBIGUOUS_HELD_GUEST`
+otherwise). With `autoRestoreHeldGuest = true` (default) `ensureSession()` /
+`signInAnonymously()` with no session restores the newest held guest instead of
+minting (`SignedIn(cause = RESTORE)` then `GuestReleased(RESTORED)`). After
+`deleteAccount()` held guests survive but are never auto-restored. `forceNew = true`
+at the cap fails with `SendoraCloudAuthError.HeldGuestLimit`.
+
+### `expectedProjectId` — the opt-in project guard
+
+```kotlin
+SendoraCloud.init(this, apiKey, projectId = P, options = SendoraCloudConfig(apiKey = apiKey, projectId = P, expectedProjectId = P))
+```
+
+A stored session whose JWT `project` claim disagrees is **withheld** — not wiped,
+not used: `auth.status() == AuthStatus.WITHHELD`, `auth.getWithheld()` says why,
+every verb fails `SESSION_WITHHELD` (kind `CONFIG`), `getAccessToken()` is `null`.
+Exits: `auth.discardWithheld()` (local only, held guests and analytics id kept) or
+relaunch with the matching key. A FRESH mint / sign-in for the wrong project fails
+`PROJECT_MISMATCH` and its tokens are revoked.
+
+### `status()` is the only way to tell `WITHHELD` from `SIGNED_OUT`
+
+`currentUser` is `null` in `UNKNOWN`, `SIGNED_OUT` and `WITHHELD`. Branch on
+`auth.status()` (or `AuthStateChange.Initial.status`), and **always give the `when`
+an `else` branch** — a later value is added in a MAJOR only because an exhaustive
+`when` written today would stop compiling:
+
+```kotlin
+when (auth.status()) {
+    AuthStatus.ANONYMOUS, AuthStatus.IDENTIFIED -> showGame()
+    AuthStatus.WITHHELD -> showWrongBuildScreen(auth.getWithheld())
+    AuthStatus.SIGNED_OUT -> showSignIn()
+    else -> showSpinner() // UNKNOWN today; anything added later
+}
+```
+
+`SendoraCloud.reset()` is unchanged on Android: it forgets the analytics identity and
+does not sign the auth session out (use `auth.signOut()`).
+
 ## Deep links (SDK-side mint + warm + deferred + revoke + stats)
 
 ```kotlin

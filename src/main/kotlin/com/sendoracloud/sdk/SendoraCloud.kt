@@ -150,6 +150,18 @@ object SendoraCloud {
         queue.startTimer(finalConfig.flushInterval)
         eventQueue = queue
 
+        // ADR-033 2c: the opt-in project guard. A canonical UUID, equal to
+        // `projectId` when both are set — a typo here must fail at first launch,
+        // loudly, not poison a device with a withheld session.
+        finalConfig.expectedProjectId?.let { expected ->
+            require(runCatching { UUID.fromString(expected).toString().equals(expected, ignoreCase = true) }.getOrDefault(false)) {
+                "SendoraCloudConfig.expectedProjectId must be a canonical UUID"
+            }
+            require(finalConfig.projectId == null || finalConfig.projectId == expected) {
+                "SendoraCloudConfig.expectedProjectId must equal projectId when both are set"
+            }
+        }
+
         auth = SendoraCloudAuth(
             client = client,
             storage = store,
@@ -157,29 +169,39 @@ object SendoraCloud {
                 currentUserId = userId
                 store.cachedUserId = userId
             },
-            onAnonymousWipe = { rotateDeviceId ->
-                // Clear the user identity on every wipe. The device (anonymous
-                // analytics) id rotates ONLY at a person-boundary — an explicit
-                // signOut or account deletion (rotateDeviceId=true). On a
-                // sign-in/upgrade or an involuntary session death it SURVIVES:
-                // same person, so pre-auth analytics link to the now-real user
-                // (parity with RN 1.38.0; the industry norm — Segment/Amplitude/
-                // Mixpanel/RevenueCat/Firebase). Rotating on logout keeps two
-                // people on a shared device from merging.
-                currentUserId = null
-                currentIdentityToken = null
-                store.cachedUserId = null
-                if (rotateDeviceId) {
+            onAnonymousWipe = { effects ->
+                // One column of the auth commit table (ADR-033 §3.3), not a
+                // policy of its own: the device (anonymous analytics) id rotates
+                // ONLY at a person boundary (explicit signOut / reset / account
+                // deletion); a sign-in, a held guest or an involuntary session
+                // death keeps it (same person — pre-auth analytics link to the
+                // now-real user; parity with RN 1.38.0). The queue is dropped only
+                // on account deletion / reset (s58.353). `discardWithheld()`
+                // asks for none of these.
+                if (effects.clearUserId) {
+                    currentUserId = null
+                    currentIdentityToken = null
+                    store.cachedUserId = null
+                }
+                if (effects.rotateDeviceId) {
                     store.regenerateDeviceId()
                     // Force-mint a fresh device id immediately so any concurrent
                     // track() that races the wipe sees the new id rather than a
                     // transiently missing one.
                     @Suppress("UNUSED_VARIABLE")
                     val _force = store.deviceId
+                    store.sessionId = UUID.randomUUID().toString()
                 }
-                store.sessionId = UUID.randomUUID().toString()
-                eventQueue?.dropAll()
+                if (effects.clearQueue) eventQueue?.dropAll()
             },
+            machine = AuthMachineConfig(
+                projectId = finalConfig.projectId,
+                expectedProjectId = finalConfig.expectedProjectId,
+                autoRestoreHeldGuest = finalConfig.autoRestoreHeldGuest,
+            ),
+            // ADR-033 2c: a withheld session quarantines analytics attribution IN
+            // MEMORY only — the persisted `user_id` is untouched (zero writes).
+            onIdentityWithheld = { currentUserId = null },
         )
 
         liveActivities = SendoraCloudLiveActivities(
@@ -455,7 +477,26 @@ object SendoraCloud {
         trackEvent("user.identified", traits ?: emptyMap())
     }
 
-    fun reset() {
+    /**
+     * Forget the ANALYTICS identity: clears the `identify()` user id and its
+     * identity token, rotates the device (anonymous analytics) id and starts a
+     * new analytics session. Unchanged from 4.25.0.
+     *
+     * ⚠ This is NOT an auth call on Android and never was: it does not sign the
+     * auth session out, does not touch held guests and does not drop the event
+     * queue (ADR-033 wave 1 lockstep ruling — a MINOR must not widen what
+     * `reset()` destroys). To end the auth session use `auth.signOut()`; to
+     * leave a withheld session use `auth.discardWithheld()`.
+     *
+     * @param includeHeldGuests accepted for API parity with RN / web, where
+     *   `reset()` IS an auth-clearing call and this also releases held guests
+     *   locally. Because Android's `reset()` clears no auth state, it has no
+     *   effect here — held guests are released only by `auth.restoreHeldGuest`,
+     *   `auth.claimHeldGuest` or `auth.discardHeldGuest`.
+     */
+    @JvmOverloads
+    @Suppress("UNUSED_PARAMETER")
+    fun reset(includeHeldGuests: Boolean = false) {
         if (!isConfigured) return
         currentUserId = null
         currentIdentityToken = null

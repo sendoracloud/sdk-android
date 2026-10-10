@@ -1,117 +1,132 @@
 package com.sendoracloud.sdk
 
+import com.sendoracloud.sdk.internal.AuthKeys
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.io.File
 
 /**
- * The other half of the corrupt-cache guard.
+ * The other half of the corrupt-cache guard — now driven BEHAVIOURALLY.
  *
- * The constructor deliberately KEEPS the stored refresh token when the cached
- * `auth_user` blob is unreadable — it is independently valid and the only thing
- * that can still recover the account. That is inert on its own: nothing turned
- * the kept token back into an identity, so the session stayed live with a
- * permanently null user and the next sign-in orphaned the account anyway.
- * `/token/refresh` returns the user in the very same response; the refresh path
- * now adopts it.
+ * The constructor KEEPS the stored refresh token when the cached `auth_user`
+ * blob is unreadable: it is independently valid and the only thing that can
+ * still recover the account. `/token/refresh` returns the user in the same
+ * response, and the refresh path adopts it (the gap-fill that settles
+ * `UNKNOWN`, ADR-033 §3.3 row 3 / row 20).
  *
- * Three properties are load-bearing and are pinned here:
- *  1. GAP-FILL ONLY — a refresh is a token rotation, not an identity change, so
- *     a live user is never overwritten.
- *  2. VALIDATED — `data.user` is nullable on this route (it tolerates a missing
- *     user row), so only a well-formed user is adopted.
- *  3. EMITS `SignedIn` — recovering an identity IS a state transition, while a
- *     plain rotation with a user already present must still emit nothing.
- *
- * Driving this behaviourally needs a `Context`-backed `Storage`, so it is pinned
- * by reading the source, the same way `AuthErrorCoercionTest` pins the anonymous
- * reuse guard. A live corrupt-blob recovery is the operator-owned device smoke.
+ * ⚠ PINS CONVERTED (4.26.0, ADR-033 wave 1). Until 4.25.0 these four tests read
+ * `SendoraCloudAuth.kt` as TEXT (`storage.clearCachedUser()`,
+ * `if (cachedUser == null)`, `parseLinkedUser(response)?.let`, one
+ * `emitAuthState(` in `refreshAccessToken`) because driving the refresh path
+ * needed a `Context`-backed `Storage`. Wave 1 put the machine behind the
+ * `AuthStore` / `AuthTransport` seams, so each pin is now the behaviour it was
+ * standing in for, asserted on a recording store and a scripted transport.
+ * A source-text pin proves "token present", never "behaves" (the s58.333
+ * guard asserted the very bug it was meant to catch). One property CHANGED on
+ * purpose and is converted, not kept: "a live user is never overwritten by a
+ * rotation" is superseded by the shared fixture row `refresh_ok.current_match`
+ * — a refresh whose user object DIFFERS installs it and emits
+ * `UserUpdated(REFRESH)` (RN reference parity); a refresh that carries NO user
+ * still leaves the live user untouched.
  */
 class RefreshUserAdoptionTest {
 
-    private val source: String by lazy {
-        val relative = "src/main/kotlin/com/sendoracloud/sdk/SendoraCloudAuth.kt"
-        var dir: File? = File(System.getProperty("user.dir") ?: ".").absoluteFile
-        while (dir != null) {
-            val candidate = File(dir, relative)
-            if (candidate.isFile) return@lazy candidate.readText()
-            dir = dir.parentFile
-        }
-        ""
-    }
+    private val u = user("aaaaaaaa-0000-4000-8000-000000000001", anonymous = true)
+    private fun tok() = jwt(u.id, "sid-A")
 
-    /** The body of `refreshAccessToken`, so a match elsewhere in the file can't
-     *  satisfy an assertion about the refresh path. */
-    private val refreshBody: String by lazy {
-        val start = source.indexOf("private suspend fun refreshAccessToken()")
-        if (start < 0) "" else source.substring(start, source.indexOf("\n    }\n", start))
+    /** LIMBO_A: a refresh token on disk, an unreadable user blob. */
+    private fun limbo(): Rig {
+        val store = RecordingStore()
+        store.secure[AuthKeys.REFRESH] = "rA"
+        store.secure[AuthKeys.ACCESS] = tok()
+        store.secure[AuthKeys.USER] = "{corrupt"
+        return Rig(store = store)
     }
 
     @Test
     fun `the corrupt-cache guard keeps the refresh token`() {
-        assertTrue("source located", source.isNotEmpty())
-        val init = source.substring(source.indexOf("    init {"), source.indexOf("val currentUser"))
-        assertTrue(
-            "an unreadable user blob drops the user + access token, NEVER the refresh token",
-            init.contains("storage.clearCachedUser()"),
-        )
-        assertEquals(
-            "no path in the constructor may clear the refresh token",
-            0,
-            Regex("""clearAuthTokens\(\)""").findAll(init).count(),
-        )
+        val rig = limbo()
+        assertEquals("an unreadable user is UNKNOWN, never signed_out", AuthStatus.UNKNOWN, rig.auth.status())
+        assertEquals("the refresh token survives the boot", "rA", rig.store.secure[AuthKeys.REFRESH])
+        assertTrue("no path in the constructor writes the refresh key", rig.store.writesTo(AuthKeys.REFRESH).isEmpty())
+        assertEquals("boot with an unsettled record writes nothing at all", emptyList<StoreWrite>(), rig.store.writes)
+        assertNull("no user is invented", rig.auth.currentUser)
+        assertEquals("the gap-fill cron is armed", 1, rig.cron.arms)
     }
 
     @Test
-    fun `refresh adopts the returned user only when there is none`() {
-        assertTrue("refreshAccessToken located", refreshBody.isNotEmpty())
-        assertTrue(
-            "gap-fill only — a live user is never overwritten by a rotation",
-            refreshBody.contains("if (cachedUser == null)"),
-        )
-        assertTrue(
-            "adopt through the parser, which rejects a null user or an empty id",
-            refreshBody.contains("parseLinkedUser(response)?.let"),
-        )
-        assertTrue(
-            "the adopted user is persisted the same way a sign-in persists one",
-            refreshBody.contains("updateLocalUser(recovered)") &&
-                refreshBody.contains("onIdentityChange(recovered.id)"),
-        )
+    fun `refresh adopts the returned user when there is none, and only a well-formed one`() = runBlocking {
+        val rig = limbo()
+        rig.transport.enqueue("/auth-service/token/refresh", refreshEnvelope(u, tok(), "rA2"))
+        rig.auth.getAccessToken()
+        assertEquals(u.id, rig.auth.currentUser?.id)
+        assertEquals(AuthStatus.ANONYMOUS, rig.auth.status())
+        assertEquals("the adopted user is persisted like a sign-in's", u.id, AuthCodecsProbe.userIdOf(rig.store.secure[AuthKeys.USER] as String))
+        assertEquals(listOf(u.id), rig.identityChanges)
+
+        // A malformed user (empty id) is NOT adopted: the record stays UNKNOWN.
+        val bad = limbo()
+        bad.transport.enqueue("/auth-service/token/refresh", refreshEnvelope(u.copy(id = ""), tok(), "rA2"))
+        bad.auth.getAccessToken()
+        assertEquals(AuthStatus.UNKNOWN, bad.auth.status())
+        assertNull(bad.auth.currentUser)
+
+        // A live session whose refresh carries NO user keeps its user (rotation only).
+        val store = RecordingStore(); store.seedLegacySession(u, tok(), "rA", 2_000_000_000_000L)
+        val live = Rig(store = store)
+        live.transport.enqueue("/auth-service/token/refresh", refreshEnvelope(null, tok(), "rA2"))
+        live.auth.getAccessToken(forceRefresh = true)
+        assertEquals(u, live.auth.currentUser)
+        assertEquals("rA2", live.auth.getRefreshToken())
     }
 
     @Test
-    fun `adoption happens after the rotated tokens are stored`() {
-        assertTrue("refreshAccessToken located", refreshBody.isNotEmpty())
-        // Ordering matters: the session install is what the adopted user belongs
-        // to, and it is only reached past the `tokenStillCurrent` race guard.
-        assertTrue(
-            "the rotated refresh token is stored before the user is adopted",
-            refreshBody.indexOf("storage.authRefreshToken = refreshToken") <
-                refreshBody.indexOf("if (cachedUser == null)"),
-        )
-        assertTrue(
-            "adoption sits behind the in-flight-replacement guard",
-            refreshBody.indexOf("if (!tokenStillCurrent(refresh)) return@withLock null") <
-                refreshBody.indexOf("if (cachedUser == null)"),
-        )
+    fun `adoption lands with the rotated tokens and never after the session was replaced`() = runBlocking {
+        val rig = limbo()
+        rig.transport.enqueue("/auth-service/token/refresh", refreshEnvelope(u, tok(), "rA2"))
+        rig.auth.getAccessToken()
+        assertEquals("the rotated refresh token is stored", "rA2", rig.store.secure[AuthKeys.REFRESH])
+        val userWrite = rig.store.writes.indexOfFirst { it.key == AuthKeys.USER }
+        val refreshWrite = rig.store.writes.indexOfFirst { it.key == AuthKeys.REFRESH && it.value == "rA2" }
+        assertTrue("the user is adopted in the same commit as the rotation", userWrite >= 0 && refreshWrite >= 0)
+
+        // The in-flight-replacement guard: a gap-fill that lands after signOut adopts nothing.
+        val raced = limbo()
+        val gate = Gate()
+        raced.transport.on("/auth-service/token/refresh") { gate.await(); refreshEnvelope(u, tok(), "rA2") }
+        val refresh = async(Dispatchers.Default) { raced.auth.getAccessToken() }
+        withTimeout(5_000) { gate.opened.await() }
+        raced.auth.signOut()
+        val mark = raced.store.writes.size
+        gate.release()
+        assertNull(withTimeout(5_000) { refresh.await() })
+        assertEquals("nothing installed after the session it belonged to was cleared", mark, raced.store.writes.size)
+        assertNull(raced.auth.currentUser)
+        assertEquals(AuthStatus.SIGNED_OUT, raced.auth.status())
     }
 
     @Test
-    fun `a recovered identity emits SignedIn and a plain rotation emits nothing`() {
-        assertTrue("refreshAccessToken located", refreshBody.isNotEmpty())
-        assertTrue(
-            "recovering an identity is a state transition and must reach listeners",
-            refreshBody.contains("emitAuthState(AuthStateChange.SignedIn(recovered))"),
-        )
-        // The ONLY emission in the refresh path. A rotation that found a user
-        // already present changes no state, so it must stay silent; the
-        // dead-token branch reports itself through wipeLocalIdentity instead.
-        assertEquals(
-            "emitAuthState sites inside refreshAccessToken",
-            1,
-            Regex("""emitAuthState\(""").findAll(refreshBody).count(),
-        )
+    fun `a recovered identity emits SignedIn and a plain rotation emits nothing`() = runBlocking {
+        val rig = limbo()
+        rig.transport.enqueue("/auth-service/token/refresh", refreshEnvelope(u, tok(), "rA2"))
+        rig.auth.getAccessToken()
+        assertEquals("recovering an identity is a state transition and must reach listeners", listOf("signed_in"), rig.eventNames)
+        assertEquals(u, (rig.events.single() as AuthStateChange.SignedIn).user)
+
+        val store = RecordingStore(); store.seedLegacySession(u, tok(), "rA", 2_000_000_000_000L)
+        val live = Rig(store = store)
+        live.transport.enqueue("/auth-service/token/refresh", refreshEnvelope(u, tok(), "rA2"))
+        live.auth.getAccessToken(forceRefresh = true)
+        assertEquals("a rotation with the same user is not a transition", emptyList<String>(), live.eventNames)
     }
+}
+
+/** Reads the `id` out of the frozen `auth_user` blob without the SDK's codec (an independent decoder). */
+internal object AuthCodecsProbe {
+    fun userIdOf(raw: String): String = org.json.JSONObject(raw).getString("id")
 }

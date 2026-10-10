@@ -10,9 +10,8 @@ import androidx.credentials.GetPublicKeyCredentialOption
 import androidx.credentials.PublicKeyCredential
 import androidx.credentials.exceptions.CreateCredentialException
 import androidx.credentials.exceptions.GetCredentialException
-import com.sendoracloud.sdk.internal.ApiClient
+import com.sendoracloud.sdk.internal.AuthTransport
 import com.sendoracloud.sdk.internal.SendoraCloudLogger
-import com.sendoracloud.sdk.internal.Storage
 import org.json.JSONObject
 
 /**
@@ -39,24 +38,29 @@ import org.json.JSONObject
  *      2. CredentialManager.getCredential(activity, …)
  *      3. POST /passkeys/authenticate/finish → tokens
  *
- * The SDK also installs the new session into Storage on a successful
- * authenticate(), mirroring signIn() behaviour.
+ * The SDK also installs the new session on a successful authenticate()
+ * through the auth commit funnel (ADR-033: a passkey sign-in is a SWITCH —
+ * a guest on this device is HELD, never retired; the finish body carries no
+ * guest hint, INV-3).
  */
 class SendoraCloudPasskeys internal constructor(
-    private val client: ApiClient,
-    private val storage: Storage,
+    private val client: AuthTransport,
     /**
-     * Validates the minted session, replaces any prior local identity and
-     * persists — in that order, so an assertion that never completes leaves the
-     * caller signed in as whoever they were. Injected by SendoraCloud.
+     * Whether EncryptedSharedPreferences is available — a minted session that
+     * cannot be persisted securely is refused before the system sheet opens.
+     */
+    private val secureAvailable: () -> Boolean,
+    /**
+     * A FRESH Bearer token for the register flow (refreshing a past-expiry one),
+     * or `null` when signed out / withheld. Injected by SendoraCloudAuth.
+     */
+    private val bearerProvider: suspend () -> String?,
+    /**
+     * Installs the minted session through `commit()` — validates it, holds a
+     * guest if one was current, persists — in that order, so an assertion that
+     * never completes leaves the caller signed in as whoever they were.
      */
     private val installSession: suspend (Map<String, Any?>) -> SendoraCloudAuthUser?,
-    /**
-     * Returns the stored anon refresh token iff the local subject is
-     * currently anonymous (device-takeover, s58.112). Injected by
-     * SendoraCloud so we don't take a hard ref on the auth object.
-     */
-    private val takeoverHintProvider: () -> String? = { null },
 ) {
     /**
      * [kind] mirrors [SendoraCloudAuthErrorKind] (4.12.0) so a caller can branch
@@ -96,7 +100,7 @@ class SendoraCloudPasskeys internal constructor(
         if (!isAvailable()) {
             return Result.failure(PasskeyError.PlatformUnsupported("Passkeys require Android 9 (API 28)+"))
         }
-        val token = storage.authAccessToken
+        val token = bearerProvider()
             ?: return Result.failure(PasskeyError.Unauthorized("Not signed in"))
         val headers = mapOf("Authorization" to "Bearer $token")
 
@@ -106,6 +110,7 @@ class SendoraCloudPasskeys internal constructor(
         }.getOrElse { return Result.failure(PasskeyError.Network(it.message ?: "register/start failed")) }
         val optionsJson = (startRes?.get("data") as? Map<*, *>)
             ?: return Result.failure(PasskeyError.Unknown("Malformed register/start response"))
+        @Suppress("UNCHECKED_CAST")
         val requestJson = JSONObject(optionsJson as Map<String, Any?>).toString()
 
         // 2. Hand off to Credential Manager.
@@ -148,7 +153,7 @@ class SendoraCloudPasskeys internal constructor(
         if (!isAvailable()) {
             return Result.failure(PasskeyError.PlatformUnsupported("Passkeys require Android 9 (API 28)+"))
         }
-        if (!storage.isSecureAvailable) {
+        if (!secureAvailable()) {
             return Result.failure(SendoraCloudAuthError.SecureStorageUnavailable("EncryptedSharedPreferences unavailable"))
         }
 
@@ -161,14 +166,14 @@ class SendoraCloudPasskeys internal constructor(
             .getOrElse { return Result.failure(PasskeyError.Network(it.message ?: "authenticate/start failed")) }
         val optionsJson = (startRes?.get("data") as? Map<*, *>)
             ?: return Result.failure(PasskeyError.Unknown("Malformed authenticate/start response"))
+        @Suppress("UNCHECKED_CAST")
         val requestJson = JSONObject(optionsJson as Map<String, Any?>).toString()
 
         // 2. Credential Manager. The prior identity stays put across the
         //    system sheet: cancelling it is a routine outcome (wrong account,
         //    no passkey on this device, back gesture), and for an anonymous
-        //    user the refresh token dropped by an early wipe is the only handle
-        //    on their account. installSession() replaces it once a session has
-        //    actually been minted.
+        //    user the refresh token is the only handle on their account.
+        //    installSession() holds it once a session has actually been minted.
         val mgr = CredentialManager.create(activityContext)
         val getRequest = GetCredentialRequest(listOf(GetPublicKeyCredentialOption(requestJson)))
         val cmResp = runCatching { mgr.getCredential(activityContext, getRequest) }
@@ -177,13 +182,12 @@ class SendoraCloudPasskeys internal constructor(
             ?: return Result.failure(PasskeyError.CredentialManagerFailed("Credential is not a passkey"))
         val responseJson = cred.authenticationResponseJson
 
-        // 3. Verify + mint session.
+        // 3. Verify + mint session. ADR-033 INV-3: the body carries the
+        //    assertion and NOTHING about the guest on this device — the guest
+        //    is held locally by the commit funnel, never retired server-side.
         val parsed = runCatching { JSONObject(responseJson) }.getOrNull()
             ?: return Result.failure(PasskeyError.CredentialManagerFailed("Non-JSON authentication response"))
-        val finishBody = mutableMapOf<String, Any>("response" to parsed.toMap())
-        // Device-takeover (s58.112): if device currently anonymous,
-        // forward the anon refresh so backend retires anon row.
-        takeoverHintProvider()?.let { finishBody["prevAnonRefreshToken"] = it }
+        val finishBody = mutableMapOf<String, Any?>("response" to parsed.toMap())
         val finishRes = runCatching {
             client.post("/auth-service/passkeys/authenticate/finish", finishBody)
         }.getOrElse { return Result.failure(PasskeyError.Network(it.message ?: "authenticate/finish failed")) }

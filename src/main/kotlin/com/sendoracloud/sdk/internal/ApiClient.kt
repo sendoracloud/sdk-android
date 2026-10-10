@@ -75,7 +75,7 @@ internal class ApiClient(
     baseUrl: String,
     private val apiKey: String,
     pinnedSPKIHashes: List<String> = emptyList(),
-) {
+) : AuthTransport {
     private val baseUrl: String = baseUrl.trimEnd('/')
     private val consecutiveFailures = AtomicInteger(0)
     private val nextAllowedAfter = AtomicLong(0)
@@ -103,21 +103,21 @@ internal class ApiClient(
             .getOrNull()
     }
 
-    suspend fun post(path: String, body: Map<String, Any?>, extraHeaders: Map<String, String>? = null): Map<String, Any?>? {
+    override suspend fun post(path: String, body: Map<String, Any?>, extraHeaders: Map<String, String>?): Map<String, Any?>? {
         if (shouldSkip()) return null
         return withTimeoutOrNull(10_000L) {
             withContext(Dispatchers.IO) { request("POST", path, body, extraHeaders) }
         }
     }
 
-    suspend fun get(path: String, extraHeaders: Map<String, String>? = null): Map<String, Any?>? {
+    override suspend fun get(path: String, extraHeaders: Map<String, String>?): Map<String, Any?>? {
         if (shouldSkip()) return null
         return withTimeoutOrNull(10_000L) {
             withContext(Dispatchers.IO) { request("GET", path, null, extraHeaders) }
         }
     }
 
-    suspend fun delete(path: String, extraHeaders: Map<String, String>? = null): Map<String, Any?>? {
+    override suspend fun delete(path: String, extraHeaders: Map<String, String>?): Map<String, Any?>? {
         if (shouldSkip()) return null
         return withTimeoutOrNull(10_000L) {
             withContext(Dispatchers.IO) { request("DELETE", path, null, extraHeaders) }

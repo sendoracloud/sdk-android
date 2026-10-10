@@ -1,5 +1,43 @@
 # Changelog
 
+## 4.26.0 — sign-in no longer retires the guest — it is held on the device
+
+ADR-033 wave 1, lockstep with RN 1.41.0 / web 3.24.0 / iOS 5.4.0. MINOR (ADR-023):
+every existing signature, frozen key and event is kept.
+
+- **Sign-in no longer retires the guest — it is held on the device.** No sign-in
+  request carries `prevAnonRefreshToken` / `linkAnonymous` / `onCredentialInUse`
+  any more. A replaced guest goes into one of 5 fixed held slots
+  (`auth_held_0..4`, EncryptedSharedPreferences) and `AuthStateChange.GuestHeld`
+  fires before the one `SignedIn(cause = SIGN_IN)`. New verbs:
+  `getHeldGuests()` / `getHeldGuest()` / `restoreHeldGuest(id?)` /
+  `discardHeldGuest(id?)` / `claimHeldGuest(id?)` (optional, destructive).
+- **`link = true` over an identified session attaches or errors (never switches).**
+  `loginSocial(link = true)` / `signInWithPlayGames(link = true)` from a guest or an
+  identified account go to `/me/link/*`; already linked → quiet success; owned
+  elsewhere → `CredentialInUse`; stale session → kind `RECENT_AUTH_REQUIRED`.
+  Typed `link(credential)` / `signInWith(credential)` return `LinkResult` /
+  `SignInResult` (`CredentialInUse.switchAccount()` is bound to the refused identity).
+- `auth.status()` (`UNKNOWN | SIGNED_OUT | ANONYMOUS | IDENTIFIED | WITHHELD`),
+  `authStateReady()`, events `Initial` / `UserUpdated` / `GuestHeld` /
+  `GuestReleased` / `SessionWithheld` and `SignedIn.cause`. The legacy `SignedIn`
+  replay on subscribe is kept (after `Initial`).
+- Opt-in `SendoraCloudConfig.expectedProjectId` (project guard → `WITHHELD`,
+  `discardWithheld()`, `PROJECT_MISMATCH`) and `autoRestoreHeldGuest` (default on).
+- `deleteAccount(alsoDiscardHeldGuests = false)` — held guests survive by default and
+  are never auto-restored afterwards; the result carries `heldGuests`.
+- `signUp()` routes by status (guest → `/me/link/email`, signed out → `/signup`,
+  identified → `AlreadyIdentified` locally); it never calls `/upgrade`.
+- Storage: an `auth_session` record is dual-written beside the four frozen keys
+  (frozen keys first); `schema_version` → `2`. A downgrade to 4.25.0 reads a valid
+  session; an `auth_session` left behind by a 4.25.0 sign-out is ignored and cleared.
+- Fixes: `getAccessToken(forceRefresh = true)` and the proactive anticipation tick
+  now really refresh (the lock-side re-check used to hand the distrusted token back).
+- `SendoraCloud.reset()` is unchanged (analytics identity only; it never signed the
+  auth session out on Android). `reset(includeHeldGuests)` is accepted for parity.
+- Deprecated, still callable: `merge(token)` (routes to the held slot), `onDeviceTakeover`
+  / `getLastAnonRetirement()` (fire only on a server-reported retirement).
+
 ## 4.25.0 — signInAnonymously() no longer replaces a signed-in account
 
 **Behaviour change.** Parity with RN 1.40.0 (reported by RopoLabs on the RN SDK; the
