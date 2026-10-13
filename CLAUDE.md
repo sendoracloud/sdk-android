@@ -1,6 +1,6 @@
 # sdk-android
 
-Published at `github.com/sendoracloud/sdk-android`, consumed via JitPack (`com.github.sendoracloud:sdk-android:1.0.2`). Kotlin 1.9+, minSdk 26.
+Published at `github.com/sendoracloud/sdk-android`, consumed via JitPack (`com.github.sendoracloud:sdk-android:<version>`; the current version shown to integrators is `SDK_RELEASES.android` in `packages/shared/src/constants/sdk-releases.ts`). Kotlin 1.9+, minSdk 26.
 
 > ⚠ **ADR-023 frozen contract.** SharedPreferences keys (`auth_*`, `event_queue`, `device_id`, `session_id`, …), the `X-Sendora-SDK-{Name,Version}` headers, and the `schema_version` marker are depended on by installed apps — never rename/remove a key (orphans session/queue on upgrade) or drop the header/marker. Version lives ONLY in `SdkVersion.kt` (must equal `build.gradle.kts`). Additive only; a format change is MAJOR + needs a migration. CI cap: `apps/backend/src/modules/developer-tools/sdk-contract-golden.test.ts`. Law: `docs/decisions/023-sdk-api-compatibility.md`.
 

@@ -21,7 +21,7 @@ Add the dependency in your module's `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("com.github.sendoracloud:sdk-android:4.0.0")
+    implementation("com.github.sendoracloud:sdk-android:4.26.3")
 }
 ```
 

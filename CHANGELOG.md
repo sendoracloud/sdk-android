@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.26.3 — README install pin
+
+No code or behaviour change (only `SDK_VERSION`, reported in `X-Sendora-SDK-Version`). The README's Gradle line was
+`com.github.sendoracloud:sdk-android:4.0.0`; JitPack versions are exact, so copying it installed 4.0.0. It
+now names the current release.
+
 ## 4.26.2 — a held guest's refresh must come back for that guest
 
 Parity with RN 1.41.2. Before the server fix (e09c86dc, already live), `/token/refresh` preferred the `sd_rt` refresh cookie over the token in the request body. A phone keeps a native cookie jar, and after a sign-in that jar holds the ACCOUNT's cookie — so refreshing a HELD guest's token was answered for the account, and the SDK wrote the account's token into the guest's slot. The device lost its only copy of the guest's credential; `claimHeldGuest()` / `merge()` then failed with 401 and `restoreHeldGuest()` released the guest. The guest's account was never touched on the server. This SDK's `HttpURLConnection` only sends cookies if the host app installs a default `CookieHandler`, so exposure was app-dependent — but it now applies the same check: a held refresh answered for anyone else fails with `HELD_GUEST_IDENTITY_MISMATCH` and changes nothing. Version bumped in BOTH `build.gradle.kts` + `SdkVersion.kt`.
