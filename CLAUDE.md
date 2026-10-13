@@ -42,6 +42,12 @@ under the new one — which corrupts every version-correlated support question
 without ever failing a build. It caught exactly this on the 4.18.0 bump.
 
 
+## 4.26.2 — held-slot refresh identity tripwire (parity RN 1.41.2, s58.360)
+
+Full write-up in the RN CLAUDE.md 1.41.2 section. A held guest's refresh must come back for that guest;
+a response for anyone else → `HELD_GUEST_IDENTITY_MISMATCH` before the slot write (claim: no `/merge`;
+restore: nothing installed, slot kept). Transport unchanged: `HttpURLConnection` attaches cookies only if the host app installed a default `CookieHandler`. Tests inside `AuthMachineConformanceTest` (claim + restore); tripwire mutation → red; full gate 42/42.
+
 ## 4.26.1 — dead session is `SESSION_EXPIRED` again; server detail in `SignedOut.endReason: String? = null` (same shape as `GuestReleased.endReason`; `AuthTx.Clear.endReason`) (RopoLabs, 2026-10-10)
 
 4.26.0 mapped the B11 `endReason` onto `signed_out.reason` (`revoked` / `deleted`). Those are two

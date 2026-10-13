@@ -1029,4 +1029,44 @@ class AuthMachineConformanceTest {
         val paths = rig.transport.requests.map { it.path }
         assertTrue(paths.indexOf("/auth-service/token/refresh") < paths.indexOf("/auth-service/login"))
     }
+
+    // ─── s58.360 — a held-slot refresh must come back for the held GUEST ────
+    //
+    // Before the server fix `/token/refresh` preferred the `sd_rt` cookie over the body, so
+    // wherever a cookie jar replayed the signed-in ACCOUNT's cookie the held guest's refresh came
+    // back for the ACCOUNT, and committing it overwrote the guest's only token (TapMap, RN on iOS).
+    // Parity RN 1.41.2 / web 3.24.2 / iOS 5.4.2: refuse BEFORE the slot write.
+    // Mutation that must turn these red: delete the `user.id != guest.userId` early return.
+
+    @Test
+    fun s58_360_claimAnsweredForAnotherUser_isRefused_slotKept() = runBlocking {
+        val rig = identifiedRig()
+        rig.store.seedHeld(0, heldSlotJson("g1", "rG1", heldAt = 10))
+        val r = Rig(store = rig.store)
+        r.transport.on("/auth-service/token/refresh") { refreshEnvelope(uB, tokB("sid-B-cookie"), "rB-by-cookie") }
+        r.transport.on("/auth-service/merge") {
+            okEnvelope(mapOf("mergedUserId" to uB.id, "deletedAnonymousId" to "g1", "tokens" to mapOf("accessToken" to tokB("sid-B2"), "refreshToken" to "rB2", "expiresIn" to 900)))
+        }
+        val res = r.auth.claimHeldGuest("g1")
+        assertEquals("HELD_GUEST_IDENTITY_MISMATCH", res.code())
+        assertEquals("the guest's slot was overwritten with the account's token", "rG1", r.store.heldJson(0)!!.getString("refreshToken"))
+        assertEquals("no /merge after a refused refresh", 0, r.transport.count("/auth-service/merge"))
+        assertEquals("the current account session is untouched", "rB", r.store.secure[AuthKeys.REFRESH])
+        assertFalse(r.eventNames.contains("guest_released"))
+    }
+
+    @Test
+    fun s58_360_restoreAnsweredForAnotherUser_isRefused_accountKept() = runBlocking {
+        val rig = identifiedRig()
+        rig.store.seedHeld(0, heldSlotJson("g1", "rG1", heldAt = 10))
+        val r = Rig(store = rig.store)
+        r.transport.on("/auth-service/token/refresh") { refreshEnvelope(uB, tokB("sid-B-cookie"), "rB-by-cookie") }
+        r.transport.on("/auth-service/token/revoke") { okEnvelope(emptyMap<String, Any?>()) }
+        val res = r.auth.restoreHeldGuest("g1")
+        assertEquals("HELD_GUEST_IDENTITY_MISMATCH", res.code())
+        assertEquals("the slot is KEPT", "rG1", r.store.heldJson(0)!!.getString("refreshToken"))
+        assertEquals(AuthStatus.IDENTIFIED, r.auth.status())
+        assertEquals("rB", r.store.secure[AuthKeys.REFRESH])
+        assertEquals("the account was not revoked", 0, r.transport.count("/auth-service/token/revoke"))
+    }
 }

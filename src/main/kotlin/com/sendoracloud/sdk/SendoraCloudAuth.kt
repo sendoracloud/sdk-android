@@ -2374,6 +2374,21 @@ class SendoraCloudAuth internal constructor(
         @Suppress("UNCHECKED_CAST")
         val user = (data["user"] as? Map<String, Any?>)?.let(AuthCodecs::userFromMap)
             ?: return HeldRefresh.Failed(SendoraCloudAuthError.Unknown("Refresh response carries no user"))
+        // ⚠ IDENTITY TRIPWIRE (s58.360, parity RN 1.41.2 / web 3.24.2 / iOS 5.4.2). The
+        // refresh must come back for the held GUEST. Before the server fix
+        // `/token/refresh` preferred the `sd_rt` cookie over the body; wherever a cookie
+        // jar replayed the signed-in ACCOUNT's cookie the 200 was the account's, and
+        // committing it overwrote the guest's only token. (This SDK's HttpURLConnection
+        // sends cookies only if the host app installed a default CookieHandler.)
+        // Refuse BEFORE the slot write: nothing written, nothing installed, slot kept.
+        if (user.id.isNotEmpty() && user.id != guest.userId) {
+            return HeldRefresh.Failed(
+                SendoraCloudAuthError.Unknown(
+                    "The held guest's refresh was answered for a different account; nothing was changed",
+                    code = "HELD_GUEST_IDENTITY_MISMATCH",
+                ),
+            )
+        }
         val record = AuthRecord(user, trio.first, trio.second, clock() + trio.third * 1000L)
         if (!commit(AuthTx.RotateHeld(index, sent = sent, newRefresh = trio.second, project = null, recordProject = false))) {
             return HeldRefresh.Failed(SendoraCloudAuthError.Superseded("The held slot changed while its token was being refreshed"))
