@@ -42,6 +42,18 @@ under the new one — which corrupts every version-correlated support question
 without ever failing a build. It caught exactly this on the 4.18.0 bump.
 
 
+## 4.27.0 — Support parity with RN 1.42.0 (s58.376)
+
+`SendoraCloudSupport.kt`: `createTicket` / `listMyTickets` / `getMyTicket` / `replyToMyTicket` (suspend, through
+`SendoraCloud.supportTransport()` = the configured `ApiClient`; refusals → `SendoraSupportException`),
+`getUnreadCount` now uses that client too (it opened its own `HttpURLConnection` to a HARDCODED production URL —
+staging builds polled prod), `deviceContext()` (`SendoraCloud.supportDeviceContext()`: versionName, longVersionCode,
+`Build.VERSION.RELEASE`, manufacturer + model, SDK), `sanitizeMetadata` (sorted keys, parity iOS), pure `contactUrl`
+(`URLEncoder` = `URLSearchParams`-compatible; token + metadata in the FRAGMENT). Constructor seams
+(`transportProvider`, `tokenProvider`, `contextProvider`) keep it unit-testable without Robolectric.
+`presentContactWidget` gained `metadata` / `includeDeviceContext` / `attachSession` / `accent` (defaulted, before
+`onResult`), `presentTicketHistory` `accent`. Guard `SupportTest.kt` (8); mutations all red.
+
 ## 4.26.2 — held-slot refresh identity tripwire (parity RN 1.41.2, s58.360)
 
 Full write-up in the RN CLAUDE.md 1.41.2 section. A held guest's refresh must come back for that guest;

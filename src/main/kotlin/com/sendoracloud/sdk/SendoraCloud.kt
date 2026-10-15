@@ -78,9 +78,34 @@ object SendoraCloud {
 
     /**
      * Wave 66 — open the worker-hosted contact widget in a WebView.
-     * Initialised eagerly because the surface has no per-app state.
+     * Initialised eagerly; since 4.27.0 its API calls go through the SDK's configured client
+     * ([supportTransport]) — `createTicket`, the player's own tickets, `deviceContext()`.
      */
     val support: SendoraCloudSupport = SendoraCloudSupport()
+
+    /** 4.27.0 — the configured client for support calls (null before `init`). */
+    internal fun supportTransport(): com.sendoracloud.sdk.internal.AuthTransport? = apiClient
+
+    /** 4.27.0 — app version + build, OS + version, device model and SDK version for a support ticket. */
+    internal fun supportDeviceContext(): Map<String, Any?> {
+        val out = LinkedHashMap<String, Any?>()
+        val ctx = appContext
+        if (ctx != null) {
+            runCatching {
+                val info = ctx.packageManager.getPackageInfo(ctx.packageName, 0)
+                info.versionName?.takeIf { it.isNotBlank() }?.let { out["appVersion"] = it }
+                @Suppress("DEPRECATION")
+                val build = if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
+                out["appBuild"] = build.toString()
+            }
+        }
+        out["os"] = "Android"
+        runCatching { android.os.Build.VERSION.RELEASE }.getOrNull()?.let { out["osVersion"] = it }
+        runCatching { "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}" }.getOrNull()
+            ?.takeIf { it.isNotBlank() && it != "null null" }?.let { out["deviceModel"] = it }
+        out["sdk"] = "${com.sendoracloud.sdk.internal.SDK_NAME}@${com.sendoracloud.sdk.internal.SDK_VERSION}"
+        return out
+    }
 
     /** Passkeys (WebAuthn via Credential Manager). API 28+ at runtime. */
     val passkeys: SendoraCloudPasskeys?

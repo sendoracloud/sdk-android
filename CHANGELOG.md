@@ -1,5 +1,21 @@
 # Changelog
 
+## 4.27.0 — Support: the player's own conversations, verified reporter, ticket context, theming
+
+Parity with RN 1.42.0 (s58.376, asked for by Sudoku Hurdle). Additive; nothing existing changes shape.
+
+- **`SendoraCloud.support.listMyTickets(widgetId)` / `getMyTicket(widgetId, ticketId)` /
+  `replyToMyTicket(widgetId, ticketId, body)`** (suspend) — the player's own tickets for a native support screen.
+  Refusals throw `SendoraSupportException` (`code`, `status`) — never an empty list.
+- **`createTicket(subject, body, …, metadata)`** (suspend) — new on Android; sends the player's access token when
+  signed in, so the ticket carries their VERIFIED user id. **`deviceContext()`** — app version + build, OS + version,
+  device model, SDK version. `SendoraCloudSupport.sanitizeMetadata(…)` — the backend's rules.
+- **`presentContactWidget`** gains `metadata`, `includeDeviceContext` (default true), `attachSession` (default true —
+  the token rides the URL fragment), `accent`; **`presentTicketHistory`** gains `accent`. All defaulted and placed
+  before `onResult`, so existing calls compile unchanged.
+- **Fix:** support calls (incl. `getUnreadCount`) always went to production — they now go through the SDK's configured
+  client (`apiBaseUrl`).
+
 ## 4.26.3 — README install pin
 
 No code or behaviour change (only `SDK_VERSION`, reported in `X-Sendora-SDK-Version`). The README's Gradle line was

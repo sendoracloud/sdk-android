@@ -21,7 +21,7 @@ Add the dependency in your module's `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("com.github.sendoracloud:sdk-android:4.26.3")
+    implementation("com.github.sendoracloud:sdk-android:4.27.0")
 }
 ```
 
@@ -235,6 +235,30 @@ val hash = SendoraCloudLinks.computeDeviceFingerprint()
 ```
 
 Bundle gate: SDK auto-supplies `appContext.packageName` on `links.create()` — backend rejects if it doesn't match a registered Android app for the project.
+
+## Support (4.27.0)
+
+Create a **Contact Widget** for this app's project in the dashboard and use its id. Signed in (guest or account), the
+SDK sends the player's session, so tickets carry their verified user id.
+
+```kotlin
+// Hosted form + My messages
+SendoraCloud.support.presentContactWidget(
+    activity,
+    widgetId = "your-widget-id",
+    metadata = mapOf("plan" to "pro", "level" to 40), // + app version, build, OS, model, SDK — added for you
+    accent = "#22c55e",
+) { result -> }
+SendoraCloud.support.presentTicketHistory(activity, widgetId = "your-widget-id", accent = "#22c55e")
+
+// Your own screens (suspend)
+val tickets = SendoraCloud.support.listMyTickets("your-widget-id")
+val ticket = SendoraCloud.support.getMyTicket("your-widget-id", "ticket-id")
+val reply = SendoraCloud.support.replyToMyTicket("your-widget-id", "ticket-id", "Still happening")
+val created = SendoraCloud.support.createTicket(subject = "Purchase not restored", body = "Bought the hint pack")
+```
+
+Refusals throw `SendoraSupportException` (`code` — e.g. `PROJECT_MISMATCH`, `NOT_SIGNED_IN` — and `status`).
 
 ## Security model
 
