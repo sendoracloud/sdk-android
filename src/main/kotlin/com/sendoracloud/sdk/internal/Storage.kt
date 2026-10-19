@@ -22,7 +22,7 @@ import java.util.UUID
  * exposed access + refresh tokens in cleartext on disk — full account
  * takeover on rooted devices or via post-uninstall data extraction.
  */
-internal class Storage(context: Context) : AuthStore {
+internal class Storage(context: Context) : AuthStore, EventQueueStore {
     private val prefs: SharedPreferences =
         context.getSharedPreferences("sendora_sdk", Context.MODE_PRIVATE)
 
@@ -181,7 +181,7 @@ internal class Storage(context: Context) : AuthStore {
     /** JSON-encoded `AuthUser`. Decoded by SendoraCloudAuth. */
     val authUserJson: String? get() = secureGet(AuthKeys.USER)
 
-    fun saveEventQueue(events: List<Map<String, Any?>>) {
+    override fun saveEventQueue(events: List<Map<String, Any?>>) {
         try {
             val jsonArray = JSONArray()
             events.forEach { event ->
@@ -198,7 +198,7 @@ internal class Storage(context: Context) : AuthStore {
         }
     }
 
-    fun loadEventQueue(): List<Map<String, Any?>> {
+    override fun loadEventQueue(): List<Map<String, Any?>> {
         val json = prefs.getString("event_queue", null) ?: return emptyList()
         return try {
             val array = JSONArray(json)
@@ -211,7 +211,32 @@ internal class Storage(context: Context) : AuthStore {
         }
     }
 
-    fun clearEventQueue() {
+    override fun clearEventQueue() {
         prefs.edit().remove("event_queue").apply()
+    }
+
+    /**
+     * 4.28.0 — per-event attempt counts, a JSON int array parallel to the
+     * frozen `event_queue` (ADR-023: additive key, the queue's own format is
+     * unchanged; a 4.27.0 simply never reads it). Plain tier: counts only.
+     */
+    override fun loadEventAttempts(): List<Int> {
+        val json = prefs.getString(EVENT_QUEUE_ATTEMPTS_KEY, null) ?: return emptyList()
+        return try {
+            val array = JSONArray(json)
+            (0 until array.length()).map { i -> array.optInt(i, 0) }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    override fun saveEventAttempts(attempts: List<Int>) {
+        val e = prefs.edit()
+        if (attempts.isEmpty()) e.remove(EVENT_QUEUE_ATTEMPTS_KEY) else e.putString(EVENT_QUEUE_ATTEMPTS_KEY, JSONArray(attempts).toString())
+        e.apply()
+    }
+
+    private companion object {
+        const val EVENT_QUEUE_ATTEMPTS_KEY = "event_queue_attempts"
     }
 }

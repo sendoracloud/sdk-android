@@ -15,7 +15,7 @@ package com.sendoracloud.sdk.internal
  * disk). Callers check [isSecureAvailable] before minting anything that would
  * need persisting.
  */
-internal interface AuthStore {
+internal interface AuthStore : PlainStore {
     val isSecureAvailable: Boolean
 
     fun secureGet(key: String): String?
@@ -29,6 +29,14 @@ internal interface AuthStore {
     /** `<= 0` removes the key. */
     fun securePutLong(key: String, value: Long)
 
+}
+
+/**
+ * The plain (non-secret) `sendora_sdk` SharedPreferences tier — the part of
+ * [AuthStore] other modules need (4.28.0: the links revoke-token map). Split
+ * out so a module that keeps no secret cannot reach the encrypted tier.
+ */
+internal interface PlainStore {
     fun plainGet(key: String): String?
 
     /** `null` removes the key. */

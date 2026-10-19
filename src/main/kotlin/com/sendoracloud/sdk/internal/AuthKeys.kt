@@ -58,6 +58,26 @@ internal object AuthKeys {
      * with a 24 h expiry); cleared by the mint's install commit.
      */
     const val MINT_KEY = "auth_mint_key"
+
+    // ── device-scoped secrets (4.28.0) — encrypted, OUTSIDE the slot ────────
+    /**
+     * F23 / F67 — the server's `knownDeviceToken`s, one per account this
+     * device signed into with a password: a JSON array of
+     * `{k: sha256(normalised email), t: token, at: unix ms}`, newest first,
+     * at most 20. The token authenticates NOTHING; it only exempts this device
+     * from the account-wide login lockouts (`login-admission.ts`).
+     *
+     * ⚠ Deliberately NOT in [SECURE_KEYS] / [SLOT_KEYS]: those are the
+     * session's keys, and a sign-out clears exactly the slot — this map must
+     * survive a sign-out AND `SendoraCloud.reset()` (the next sign-in on this
+     * device is the one it is for). Only `deleteAccount()` removes an entry —
+     * the deleted account's. Encrypted all the same
+     * ([DEVICE_SECRET_KEYS] routes it to the secure tier); never logged.
+     */
+    const val KNOWN_DEVICE_TOKENS = "auth_known_devices"
+
+    /** Secure-tier keys that are NOT session state (survive sign-out and reset; deleteAccount prunes its own entry). */
+    val DEVICE_SECRET_KEYS: List<String> = listOf(KNOWN_DEVICE_TOKENS)
 }
 
 /**

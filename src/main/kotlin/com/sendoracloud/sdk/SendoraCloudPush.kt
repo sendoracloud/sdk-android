@@ -1,6 +1,6 @@
 package com.sendoracloud.sdk
 
-import com.sendoracloud.sdk.internal.ApiClient
+import com.sendoracloud.sdk.internal.AuthTransport
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import java.util.Locale
@@ -36,9 +36,18 @@ import java.util.TimeZone
  * leak: scope is bound to process lifetime, GC-clean on kill.
  */
 class SendoraCloudPush internal constructor(
-    private val client: ApiClient,
+    private val client: AuthTransport,
     private val scope: CoroutineScope,
     private val userIdProvider: () -> String?,
+    /**
+     * 4.28.0 (F67) — the signed-in player's access token, when a session
+     * exists. `POST /push/tokens` proves WHICH player a token belongs to only
+     * through `Authorization: Bearer <end-user access token>`; a body `userId`
+     * is a claim the server does not take from a publishable key alone.
+     * Best-effort: no session, or a token that cannot be read, registers
+     * exactly as before (no header).
+     */
+    private val accessTokenProvider: suspend () -> String? = { null },
 ) {
     enum class Platform(val wire: String) {
         /** FCM (Android, default). */
@@ -77,7 +86,9 @@ class SendoraCloudPush internal constructor(
 
         scope.launch {
             try {
-                val response = client.post("/push/tokens", body) ?: run {
+                val bearer = runCatching { accessTokenProvider() }.getOrNull()?.takeIf { it.isNotEmpty() }
+                val headers = bearer?.let { mapOf("Authorization" to "Bearer $it") }
+                val response = client.post("/push/tokens", body, headers) ?: run {
                     completion?.invoke(Result.failure(IllegalStateException("empty response")))
                     return@launch
                 }

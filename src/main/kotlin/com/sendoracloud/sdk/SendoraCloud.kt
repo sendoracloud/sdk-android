@@ -164,12 +164,16 @@ object SendoraCloud {
         val client = ApiClient(finalConfig.apiBaseUrl, finalConfig.apiKey, finalConfig.pinnedSPKIHashes)
         apiClient = client
 
-        val queue = EventQueue(store, finalConfig.flushAt, finalConfig.maxQueueSize)
+        val queue = EventQueue(
+            store, finalConfig.flushAt, finalConfig.maxQueueSize,
+            // Round 3: the CURRENT identity token, attached at send time (never stored).
+            decorate = { e -> decorateWithIdentity(e, currentUserId, currentIdentityToken) },
+        )
         queue.setFlushHandler { events ->
-            // Return false → events stay queued (ACK-before-remove). When consent
+            // Deferred → events stay queued (ACK-before-remove). When consent
             // isn't granted yet, keep them buffered until consent.subscribe()
             // re-flushes on grant rather than dropping the batch.
-            if (!consent.isGranted) false
+            if (!consent.isGranted) FlushResult.Deferred
             else flushEvents(events, client)
         }
         queue.startTimer(finalConfig.flushInterval)
@@ -245,6 +249,8 @@ object SendoraCloud {
             client = client,
             scope = scope,
             userIdProvider = { currentUserId },
+            // 4.28.0: the player's Bearer when signed in (best-effort; see the parameter).
+            accessTokenProvider = { auth?.getAccessToken() },
         )
 
         links = SendoraCloudLinks(
@@ -252,6 +258,7 @@ object SendoraCloud {
             packageName = appContext.packageName,
             linkHosts = finalConfig.linkHosts,
             scope = scope,
+            revokeTokenStore = store,
         )
 
         isConfigured = true
@@ -349,7 +356,9 @@ object SendoraCloud {
             callback(null); return
         }
         scope.launch {
-            val body = mutableMapOf<String, Any?>("projectId" to cfg.projectId)
+            // ⚠ Never a null value: Android's org.json writes it as JSON null (4.28.0).
+            val body = mutableMapOf<String, Any?>()
+            cfg.projectId?.let { body["projectId"] = it }
             body["deviceId"] = store.deviceId
             val response = client.post("/attribution/deferred", body)
             val data = (response?.get("data") as? Map<*, *>)
@@ -384,38 +393,17 @@ object SendoraCloud {
             return
         }
 
-        val event = buildMap<String, Any?> {
-            put("projectId", cfg.projectId)
-            put("module", "custom")
-            put("eventType", name)
-            put("timestamp", isoFormatter.format(Date()))
-            put("properties", properties ?: emptyMap<String, Any>())
-            put("context", mapOf(
-                "device" to (deviceContext?.toMap() ?: emptyMap()),
-                "sdk" to mapOf("name" to SDK_NAME, "version" to SDK_VERSION),
-            ))
-            put("sessionId", storage?.sessionId ?: "")
-            // Fixed placeholder, not per-purpose granularity. `consent` here
-            // is a single boolean gate (see SendoraCloudConsent); the array is
-            // a constant marker matching the web/iOS SDKs, NOT a list of the
-            // specific purposes the user granted. The backend must not gate
-            // purpose-scoped processing (e.g. marketing vs analytics) on this
-            // value — buffering already happens client-side until consent is
-            // granted. Make SendoraCloudConsent purpose-aware before relying
-            // on this array for anything finer-grained.
-            put("consent", listOf("analytics"))
-            val uid = currentUserId
-            if (uid != null) {
-                put("userId", uid)
-            } else {
-                // No identified user yet — attach the stable device id as
-                // anonymousId so the backend's coalesce(user_id, anonymous_id)
-                // identity (s58.219) counts this install instead of
-                // undercounting Android anonymous users. Mirrors sdk-ios.
-                storage?.deviceId?.let { put("anonymousId", it) }
-            }
-            currentIdentityToken?.let { put("identityToken", it) }
-        }
+        val event = buildEventPayload(
+            projectId = cfg.projectId,
+            name = name,
+            timestamp = isoFormatter.format(Date()),
+            properties = properties,
+            device = deviceContext?.toMap(),
+            sessionId = storage?.sessionId,
+            userId = currentUserId,
+            anonymousId = if (currentUserId == null) storage?.deviceId else null,
+            identityToken = currentIdentityToken,
+        )
         scope.launch { eventQueue?.add(event) }
     }
 
@@ -430,6 +418,11 @@ object SendoraCloud {
         if (!isConfigured) return
         val cfg = config ?: return
         if (cfg.autoTrackEngagement) engFlush()
+        // 4.28.0: the same bound the event name has (the backend caps names at 128).
+        if (!isValidScreenName(name)) {
+            SendoraCloudLogger.error("trackScreen: screen name must be 1–$MAX_SCREEN_NAME_LENGTH characters — not sent")
+            return
+        }
         val props = (properties ?: emptyMap()) + mapOf("screenName" to name)
         trackEvent("screen.viewed", props)
         if (cfg.autoTrackEngagement) engEnter(name)
@@ -513,6 +506,11 @@ object SendoraCloud {
      * `reset()` destroys). To end the auth session use `auth.signOut()`; to
      * leave a withheld session use `auth.discardWithheld()`.
      *
+     * 4.28.0: this device's `knownDeviceToken`s (the per-account login-lockout
+     * exemptions a password sign-in earns) deliberately SURVIVE `reset()`, as
+     * they survive `signOut()` — apps call this at logout. Only
+     * `auth.deleteAccount()` removes one (the deleted account's).
+     *
      * @param includeHeldGuests accepted for API parity with RN / web, where
      *   `reset()` IS an auth-clearing call and this also releases held guests
      *   locally. Because Android's `reset()` clears no auth state, it has no
@@ -562,12 +560,13 @@ object SendoraCloud {
         // signals only (see the compliance note at init). This is the silent-default
         // removal (parity with iOS).
         val baseBody = mutableMapOf<String, Any?>(
-            "projectId" to cfg.projectId,
             "deviceId" to store.deviceId,
             "appVersion" to (deviceContext?.appVersion ?: ""),
             "os" to "Android",
             "osVersion" to (deviceContext?.osVersion ?: ""),
         )
+        // ⚠ Never a null value: Android's org.json writes it as JSON null (4.28.0).
+        cfg.projectId?.let { baseBody["projectId"] = it }
 
         // Wave 51 — Play Install Referrer. When host app has the
         // `com.android.installreferrer:installreferrer` dep AND Play
@@ -605,18 +604,77 @@ object SendoraCloud {
     }
 
     /**
-     * Send a batch and report whether the backend ACCEPTED it. The EventQueue
-     * only removes the events once this returns true (ACK-before-remove,
-     * ADR-023 §7) — a network error / 5xx returns false and the batch stays
-     * queued for the next flush instead of being silently dropped.
+     * Send ONE chunk (the queue never hands over more than
+     * [EventQueue.MAX_BATCH] = 100, what `/events/batch` accepts) and report the
+     * answer. The queue removes the events on a 2xx (ACK-before-remove, ADR-023
+     * §7), drops them on a permanent 4xx, and keeps them on anything transient,
+     * waiting at least the server's `Retry-After` (4.28.0, F67).
      */
-    private suspend fun flushEvents(events: List<Map<String, Any?>>, client: ApiClient): Boolean {
-        if (events.isEmpty()) return true
-        return if (events.size == 1) {
-            val response = client.post("/events", events.first())
-            (response?.get("success") as? Boolean) == true
-        } else {
-            client.postBatch("/events/batch", events)
-        }
+    internal suspend fun flushEvents(events: List<Map<String, Any?>>, client: ApiClient): FlushResult {
+        if (events.isEmpty()) return FlushResult.Sent(200)
+        // ⚠ Always the batch route, even for one event: `/events` caps a body at
+        // 32 KB, so a lone 32–60 KB event 413'd there and was dropped (round 3).
+        val rich = client.sendEvents(EVENTS_BATCH_PATH, eventsBatchBody(events))
+        return FlushResult.Sent(
+            rich.statusCode, rich.retryAfterSeconds, rich.cfMitigated, rich.errorCode,
+            identityRejected = if (rich.statusCode in 200..299) identityRejectedIndices(rich.body, events.size) else emptySet(),
+        )
     }
+}
+
+/** The one route the queue posts to (1–100 events, ≤ 64 KB). */
+internal const val EVENTS_BATCH_PATH = "/events/batch"
+
+internal fun eventsBatchBody(events: List<Map<String, Any?>>): Map<String, Any?> = mapOf("events" to events)
+
+/** Screen names share the event-name bound (`eventType` ≤ 128 server-side). */
+internal const val MAX_SCREEN_NAME_LENGTH = 128
+
+internal fun isValidScreenName(name: String): Boolean = name.isNotEmpty() && name.length <= MAX_SCREEN_NAME_LENGTH
+
+/**
+ * The `/events` payload for one event (pure, so the JVM suite can pin it).
+ *
+ * ⚠ 4.28.0: a key is written ONLY when its value is non-null. Android's
+ * built-in `org.json` serializes a null map value as JSON `null`, and the
+ * backend's `.optional()` fields reject null — `projectId: null` (every app that
+ * calls `init` without a projectId) failed the WHOLE batch with a 400, which the
+ * new permanent-4xx rule would then drop. The JVM's org.json omits nulls, so only
+ * a test on the MAP (not on serialized JSON) can see this.
+ */
+internal fun buildEventPayload(
+    projectId: String?,
+    name: String,
+    timestamp: String,
+    properties: Map<String, Any>?,
+    device: Map<String, Any>?,
+    sessionId: String?,
+    userId: String?,
+    anonymousId: String?,
+    identityToken: String?,
+): Map<String, Any?> = buildMap {
+    projectId?.let { put("projectId", it) }
+    put("module", "custom")
+    put("eventType", name)
+    put("timestamp", timestamp)
+    put("properties", properties ?: emptyMap<String, Any>())
+    put("context", mapOf(
+        "device" to (device ?: emptyMap()),
+        "sdk" to mapOf("name" to SDK_NAME, "version" to SDK_VERSION),
+    ))
+    put("sessionId", sessionId ?: "")
+    // Fixed placeholder, not per-purpose granularity. `consent` here is a single
+    // boolean gate (see SendoraCloudConsent); the array is a constant marker
+    // matching the web/iOS SDKs, NOT a list of the specific purposes the user
+    // granted. The backend must not gate purpose-scoped processing on it.
+    put("consent", listOf("analytics"))
+    if (userId != null) {
+        put("userId", userId)
+    } else {
+        // No identified user yet — the stable device id as anonymousId so the
+        // backend's coalesce(user_id, anonymous_id) identity (s58.219) counts this
+        // install. Mirrors sdk-ios.
+        anonymousId?.let { put("anonymousId", it) }
+    }
+    identityToken?.let { put("identityToken", it) }
 }

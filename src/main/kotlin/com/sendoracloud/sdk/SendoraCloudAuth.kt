@@ -8,6 +8,7 @@ import com.sendoracloud.sdk.internal.AuthStore
 import com.sendoracloud.sdk.internal.AuthTransport
 import com.sendoracloud.sdk.internal.HeldGuest
 import com.sendoracloud.sdk.internal.HeldSlot
+import com.sendoracloud.sdk.internal.KnownDeviceTokens
 import com.sendoracloud.sdk.internal.ProjectVerdict
 import com.sendoracloud.sdk.internal.RefreshCron
 import com.sendoracloud.sdk.internal.SendoraCloudLogger
@@ -1417,14 +1418,20 @@ class SendoraCloudAuth internal constructor(
      * account is revoked; emits `GuestHeld` (if held) then ONE `SignedIn`.
      */
     private suspend fun performSwitch(path: String, body: Map<String, Any?>): Result<SignInResult> = identityAttempt { expect ->
-        val response = client.post(path, body)
+        val response = client.post(path, withKnownDeviceToken(path, body))
         parseError(response)?.let { return@identityAttempt Result.failure(it) }
         @Suppress("UNCHECKED_CAST")
         val data = response?.get("data") as? Map<String, Any?>
             ?: return@identityAttempt Result.failure(SendoraCloudAuthError.Unknown("Malformed response"))
+        // 4.28.0: remember the server's device token for this account (a success
+        // only — parseError above returned every refusal). Before the MFA branch:
+        // a password step that needs MFA mints nothing today, but if it ever
+        // does, it is the same account.
+        rememberKnownDeviceToken(path, body, data)
         if (data["mfaRequired"] == true) {
             val challengeToken = data["mfaChallengeToken"] as? String
                 ?: return@identityAttempt Result.failure(SendoraCloudAuthError.Unknown("Missing mfaChallengeToken"))
+            (body["email"] as? String)?.let { rememberMfaEmail(challengeToken, it) }
             @Suppress("UNCHECKED_CAST")
             mfaUserIdHint = (data["user"] as? Map<String, Any?>)?.get("id") as? String
             // Nothing minted yet; the current session stays live. The context
@@ -1456,6 +1463,56 @@ class SendoraCloudAuth internal constructor(
             else -> Result.failure(outcome.asError(record))
         }
     }
+
+    // ─── knownDeviceToken (4.28.0, F23/F67) ─────────────────────────────────
+    //
+    // `/login` and `/mfa/challenge` successes carry an additive
+    // `data.knownDeviceToken`; `/login` accepts it back. It authenticates
+    // nothing — it only exempts THIS device from the account-wide login
+    // lockouts, so a stranger hammering a player's email cannot lock the
+    // player out on their own phone. Stored encrypted under
+    // `AuthKeys.KNOWN_DEVICE_TOKENS` (outside the session slot), written only
+    // through `commit(AuthTx.KnownDevice / ForgetKnownDevice)`, never logged.
+    // ⚠ Lifetime rule (all four SDKs): it survives signOut() AND
+    // SendoraCloud.reset() (apps call reset() at logout — dropping it there
+    // would undo the protection exactly when it matters); ONLY deleteAccount()
+    // removes an entry, and only the deleted account's.
+
+    /** challengeToken → the email that started it, so an MFA success can file its device token. Bounded. */
+    private val mfaEmailByChallenge = LinkedHashMap<String, String>()
+
+    private fun rememberMfaEmail(challengeToken: String, email: String) {
+        synchronized(mfaEmailByChallenge) {
+            mfaEmailByChallenge.remove(challengeToken)
+            mfaEmailByChallenge[challengeToken] = email
+            while (mfaEmailByChallenge.size > 8) mfaEmailByChallenge.remove(mfaEmailByChallenge.keys.first())
+        }
+    }
+
+    private fun knownDeviceEntries(): List<KnownDeviceTokens.Entry> =
+        KnownDeviceTokens.decode(storage.secureGet(AuthKeys.KNOWN_DEVICE_TOKENS))
+
+    /** The `/login` body with this device's token for that email (every password sign-in goes through here). */
+    private fun withKnownDeviceToken(path: String, body: Map<String, Any?>): Map<String, Any?> {
+        if (path != "/auth-service/login" || body.containsKey("knownDeviceToken")) return body
+        val email = body["email"] as? String ?: return body
+        val token = KnownDeviceTokens.lookup(knownDeviceEntries(), email) ?: return body
+        return body + ("knownDeviceToken" to token)
+    }
+
+    private fun rememberKnownDeviceToken(path: String, body: Map<String, Any?>, data: Map<String, Any?>) {
+        val token = data["knownDeviceToken"] as? String
+        if (!KnownDeviceTokens.isUsable(token)) return
+        val email = when (path) {
+            "/auth-service/login" -> body["email"] as? String
+            "/auth-service/mfa/challenge" -> (body["challengeToken"] as? String)
+                ?.let { ct -> synchronized(mfaEmailByChallenge) { mfaEmailByChallenge.remove(ct) } }
+                ?: (objectField(data["user"])?.get("email") as? String)
+            else -> null
+        } ?: return
+        commit(AuthTx.KnownDevice(email, token!!))
+    }
+
 
     /** `SignInResult.MfaRequired.verify` — a SIGN-IN continuation under the mutex. */
     private suspend fun challengeMfaTyped(challengeToken: String, code: String): Result<SignInResult> = serialize {
@@ -1770,6 +1827,9 @@ class SendoraCloudAuth internal constructor(
         }
         @Suppress("UNCHECKED_CAST")
         val data = res["data"] as? Map<String, Any?>
+        // 4.28.0: the deleted account's known-device token is useless now — forget
+        // THAT entry only (other accounts on this device keep theirs).
+        currentUser?.email?.let { commit(AuthTx.ForgetKnownDevice(it)) }
         commit(AuthTx.Clear(
             reason = AuthSignedOutReason.ACCOUNT_DELETED, expectRefresh = sentRefresh, revokeToken = null,
             effects = AuthWipeEffects(rotateDeviceId = true, clearQueue = true, clearUserId = true),
@@ -2748,6 +2808,10 @@ class SendoraCloudAuth internal constructor(
         class Release(val index: Int, val reason: GuestReleasedReason, val endReason: String?, val silent: Boolean = false) : AuthTx()
         class HeldReported(val userId: String) : AuthTx()
         class MintKey(val key: String?) : AuthTx()
+        /** 4.28.0 — remember the server's `knownDeviceToken` for this email (newest first, ≤ 20). */
+        class KnownDevice(val email: String, val token: String) : AuthTx()
+        /** 4.28.0 — deleteAccount's half: forget the deleted account's known-device token only. */
+        class ForgetKnownDevice(val email: String) : AuthTx()
         object ClearStaleBlob : AuthTx()
         /** An `auth_session` record with no matching frozen refresh key (a 4.25.0 signed out / deleted under it). */
         object DropLeftoverRecord : AuthTx()
@@ -2988,6 +3052,18 @@ class SendoraCloudAuth internal constructor(
 
     private fun commit(tx: AuthTx.MintKey) {
         storage.plainPut(AuthKeys.MINT_KEY, tx.key)
+    }
+
+    private fun commit(tx: AuthTx.KnownDevice) {
+        val next = KnownDeviceTokens.put(knownDeviceEntries(), tx.email, tx.token, clock())
+        storage.securePut(AuthKeys.KNOWN_DEVICE_TOKENS, KnownDeviceTokens.encode(next))
+    }
+
+    private fun commit(tx: AuthTx.ForgetKnownDevice) {
+        val current = knownDeviceEntries()
+        val next = KnownDeviceTokens.remove(current, tx.email)
+        if (next.size == current.size) return
+        storage.securePut(AuthKeys.KNOWN_DEVICE_TOKENS, if (next.isEmpty()) null else KnownDeviceTokens.encode(next))
     }
 
     @Suppress("UNUSED_PARAMETER")

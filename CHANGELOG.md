@@ -1,5 +1,49 @@
 # Changelog
 
+## 4.28.0 — offline backlogs drain; the SDK honours Retry-After; device tokens; final link revokes
+
+Audit F67 (with the server halves of F23, F34, F53). Additive; nothing existing changes shape.
+
+- **Fix: a large offline backlog never sent.** The queue sent everything it held (up to 1000 events) as one
+  `/events/batch` request, and the backend accepts at most 100 — once more than 100 events queued offline, every flush
+  was refused and nothing was ever sent again. It now sends chunks of at most 100 events and at most 60,000 bytes
+  (the backend refuses bodies over 64 KB; one event may carry 32 KB of properties), oldest first.
+- **Fix: one refused batch blocked the queue for good.** A permanent refusal kept those events at the head forever.
+  A 400 / 413 / 422 on a batch now halves it and resends, so only the event that is actually refused is dropped;
+  401 / 403 / 404 drop the batch. A 401 `IDENTITY_UNVERIFIED` is temporary, not permanent — and so is an event the
+  server accepted the batch around but refused for identity (`data.rejected[].code`): it stays queued and is retried. A temporary answer (408, 429,
+  5xx) keeps them; each event gets 50 answered attempts. Being offline, a 429, a Cloudflare challenge and Cloudflare's
+  own 520–527 / 530 spend none of them (they still wait, honouring `Retry-After`).
+- **Bounded retries.** A halved batch size stays halved until a batch succeeds; one flush sends at most 20 requests,
+  then waits. Three server errors in a row on the same batch halve it, so one event the server cannot take no longer
+  holds back the others. Every queued event — even a lone one — goes to `/events/batch` (the single-event route caps
+  bodies at 32 KB). The identity token is attached when an event is SENT, so an event kept after an identity refusal
+  picks up the app's current token.
+- **Retries back off politely.** Full jitter (a random wait up to min(60 s, 2ⁿ s)) instead of every device retrying
+  on the same second, and never sooner than the server's `Retry-After` (capped at 1 h). A Cloudflare challenge
+  (`cf-mitigated`) waits at least 60 s. A plain 4xx never trips the circuit breaker. A 429 holds the whole client for
+  at most 60 s; the full wait reaches the caller (`error.details.retryAfterSeconds`).
+- **A Cloudflare challenge is never a dead session.** On an auth call it is a retryable network failure — never
+  `INVALID_CREDENTIAL`, and it never signs anyone out.
+- **Known-device token.** A password sign-in (and an MFA success) now keeps the server's `knownDeviceToken` for that
+  account (encrypted, at most 20 accounts) and sends it on the next sign-in. Someone hammering a player's email can no
+  longer lock the player out on their own phone. It survives `signOut()` and `SendoraCloud.reset()`; `deleteAccount()`
+  removes that account's token only.
+- **Push tokens prove the player.** `push.registerToken` sends the signed-in player's access token
+  (`Authorization: Bearer`), so the server can bind the device to the verified user. With no session it registers as
+  before.
+- **Final link revokes.** `LinkCreateResult.revokeToken` (new, defaulted) is kept on the device per shortcode (newest
+  200). `links.revoke(shortcode, revokeToken: String?) { Result<LinkRevokeResult> }` presents it (an explicit token
+  wins), which makes the revoke FINAL, and reports `final`. The 4.27.0 `revoke(shortcode) { Result<Unit> }` presents
+  the kept token too. A link minted elsewhere (no token) is still revoked soft. A Cloudflare challenge is now `NETWORK`,
+  never `UNAUTHORIZED`.
+- **Fix: events from an app initialised without a `projectId` were refused.** Android writes a missing value as JSON
+  `null`, which the backend rejects for the whole batch. Events, install and deferred-link requests no longer carry a
+  null value, and events already queued by 4.27.0 are cleaned before sending.
+- `trackScreen` refuses a screen name longer than 128 characters (logged), the same bound event names have.
+- Also fixed: a refusal with no body was read as a network failure and armed the circuit breaker; a huge `Retry-After`
+  overflowed and was ignored.
+
 ## 4.27.0 — Support: the player's own conversations, verified reporter, ticket context, theming
 
 Parity with RN 1.42.0 (s58.376, asked for by Sudoku Hurdle). Additive; nothing existing changes shape.

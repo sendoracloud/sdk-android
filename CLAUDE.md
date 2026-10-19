@@ -42,6 +42,168 @@ under the new one — which corrupts every version-correlated support question
 without ever failing a build. It caught exactly this on the 4.18.0 bump.
 
 
+## 4.28.0 — F67: queue chunks + permanent-4xx drop, Retry-After / cf-mitigated, knownDeviceToken, push Bearer, final link revoke (s58.402)
+
+**Why.** Two shipped queue defects made an offline backlog permanent: `EventQueue` sent the WHOLE queue (≤ 1000) as ONE
+`/events/batch` (backend `batchEventsSchema.max(100)`) → a 400 on every flush once > 100 queued; and a permanent 4xx
+kept the chunk at the head forever. Plus the backend's F67 contract (every 429/503 carries `Retry-After` + the same
+`error.details.retryAfterSeconds`; Cloudflare may answer `cf-mitigated: challenge` with 403/503) and the server halves
+of F23 (`knownDeviceToken`), F53 (push binding by Bearer), F34 (link `revokeToken`).
+
+**What.**
+- `internal/EventQueue.kt`: chunks of ≤ `MAX_BATCH` (100), oldest first, removal by entry IDENTITY (mid-flight adds and
+  overflow trims can no longer shift what a flush removes). `classifyFlush` (pure): cf-mitigated → RETRY (checked
+  FIRST, a 403 challenge is never a DROP); 2xx ACCEPTED; 0 RETRY_UNANSWERED; 400/401/403/404/413/422 DROP; everything
+  else (408/429/5xx/402/409…) RETRY. RETRY counts one attempt per sent event, dropped at `MAX_ATTEMPTS` (50);
+  UNANSWERED (offline) spends NO budget. Backoff = `Backoff.delayMs` (full jitter random(0, min(60 s, 2ⁿ s)), floor
+  `Retry-After` capped 1 h, cf ≥ 60 s); no flush starts before it. Handler returns `FlushResult` (`Deferred` for
+  consent-pending: no attempt, no backoff). Attempt counts persist under the ADDITIVE plain key `event_queue_attempts`
+  (parallel JSON int array — never inside an event, which is sent verbatim); a length mismatch = all zeros.
+  Seam: `EventQueueStore` (Storage implements it).
+- `internal/ApiClient.kt`: one `exchange()` feeds both response shapes; reads `Retry-After` (seconds or HTTP-date) +
+  `cf-mitigated`. Breaker: 503 / cf → failure with the server floor; other 5xx / I/O → failure, full jitter; **429 →
+  a hold of min(Retry-After, 60 s), count untouched**; any other 4xx → never trips. Envelope path: cf → `null`
+  (offline — so no auth path can read a challenge as a dead credential or wipe a session); a header-only wait is
+  stamped into `error.details.retryAfterSeconds`. Rich path: `RichResponse.retryAfterSeconds` / `cfMitigated`
+  (code `CF_CHALLENGE`); a breaker refusal reports the time left. Also fixed: a bodiless 4xx (null `errorStream`) threw
+  and armed the breaker. Seams: `clock`, `random`, `RichTransport`.
+- `knownDeviceToken`: `AuthKeys.KNOWN_DEVICE_TOKENS` (`auth_known_devices`, secure tier, in the NEW
+  `DEVICE_SECRET_KEYS`, deliberately NOT `SECURE_KEYS`/`SLOT_KEYS` — the conformance equality stays true and signOut
+  keeps it). `{k: sha256(trim+lowercase(ROOT) email), t, at}`, newest 20 (`internal/KnownDeviceTokens.kt`). Saved from
+  `/login` + `/mfa/challenge` successes in `performSwitch` (the ONE funnel every password / ADOPT / MFA sign-in uses)
+  via `commit(AuthTx.KnownDevice)`; MFA files it under the email that started the challenge (in-memory, ≤ 8). Sent on
+  every `/login` body. ⚠ Lifetime (same rule on all four SDKs, review M5): survives `signOut()` AND
+  `SendoraCloud.reset()` / `resetSession` (apps reset at logout); ONLY `deleteAccount()` removes an entry — the deleted
+  account's (`AuthTx.ForgetKnownDevice(email)`, captured before the Clear). Never logged; tokens > 2048 ignored.
+- **Review fixes (adversarial pass).** (H1) chunks are also bounded to `MAX_BATCH_BYTES` = 60 000 serialized UTF-8
+  bytes (`/events/batch` 413s a body > 64 KB; one event may carry 32 KB) — size cached per entry, an oversized event
+  goes alone. (M1) 400 / 413 / 422 on a MULTI-event chunk → `BISECT`: halve and resend (no removal, attempt or
+  backoff); a single event still refused DROPs; after an accepted half the limit doubles back (round 3: a dropped
+  culprit no longer resets it — see below). 401 `IDENTITY_UNVERIFIED` → RETRY (`FlushResult.Sent.errorCode`). `trackScreen` refuses names
+  > 128. (M2) ⚠⚠ Android's built-in `org.json` writes a null map value as JSON `null` and the schema's `.optional()`
+  fields reject it — `projectId: null` failed EVERY batch of an app initialised without one, and the new permanent-4xx
+  rule would have dropped them all. The JVM's org.json 20231013 OMITS nulls, so no JSON-level JVM test can see it:
+  `buildEventPayload` (pure) writes a key only when non-null, the queue `compactEvent`s every entry (top level + nested
+  maps, NOT inside `properties`; also strips `JSONObject.NULL` from a persisted 4.27.0 queue), and the install /
+  deferred bodies dropped their `projectId to null`. Tests assert on the MAP. (LOW) `Backoff.serverFloorMs` caps the
+  seconds BEFORE `* 1000` (overflow went negative → wait ignored).
+- **Per-event identity refusals in a 2xx (backend s58.402).** `data.rejected[i] = {index, reason, code}`:
+  rows with `code == "IDENTITY_UNVERIFIED"` (or, with NO code, a `reason` containing "identity", any case) are KEPT,
+  spend one attempt and back off, and the pass stops (they sit at the head); every other row is removed with the
+  accepted events, by identity (`identityRejectedIndices` + `FlushResult.Sent.identityRejected`, parity RN). A
+  whole-chunk `401 IDENTITY_UNVERIFIED` only when identity refused every event; a mixed refusal is `422
+  EVENTS_REJECTED` → bisection. ⚠ The `flushEvents` wiring in `SendoraCloud.kt` needs a Context, so it is not JVM-tested.
+- **Round 3 (second adversarial review; same rules on all four SDKs).** (1) An edge challenge, a 429 and Cloudflare
+  520–527 / 530 are RETRY_UNANSWERED — they back off (server wait / 60 s floor honoured) but spend NO budget. (2) The
+  identity token is attached at SEND time by `decorate` = `decorateWithIdentity(event, currentUserId,
+  currentIdentityToken)` (only when the event's `userId` IS the identified user; replaces a stale stamp; never stored);
+  the decorated size is what the 60 000-byte cap counts. (3) The chunk cap is a queue FIELD: a BISECT halves it and it
+  stays halved — across passes and through a dropped lone event — until a SUCCESS doubles it back; one flush makes at
+  most `MAX_POSTS_PER_FLUSH` = 20 POSTs, then (if the pass bisected / dropped) waits the normal backoff. (4) Three
+  answered 5xx in a row on the SAME multi-event chunk (same head entry, same size) halve the cap; a lone event spends
+  its 50 attempts. (5) Every queued event goes to `/events/batch` — `/events` caps a body at 32 KB, so a lone 32–60 KB
+  event 413'd and dropped (`flushEvents` is `internal` now so the suite drives it against a real socket).
+- `SendoraCloudPush.registerToken`: `Authorization: Bearer <auth.getAccessToken()>` when a session exists; a null /
+  throwing provider registers exactly as before (the server treats a bad Bearer as unproven, not an error).
+- Links: `LinkCreateResult.revokeToken: String? = null` + the 4.27.0 7-arg secondary constructor (binary-compatible;
+  ⚠ `copy()` gained a parameter — a binary caller of the old `copy` would break; acceptable for a result type);
+  `toString` redacts it. Kept per shortcode in plain prefs `link_revoke_tokens` (newest 200, `PlainStore` seam).
+  New `revoke(shortcode, revokeToken: String?) { Result<LinkRevokeResult(shortcode, final)> }` (explicit token wins,
+  else the kept one; forgotten on success; wrong token → 403 UNAUTHORIZED, kept). The 4.27.0
+  `revoke(shortcode) { Result<Unit> }` delegates (so it now presents the kept token → FINAL). cf → `NETWORK`.
+
+**Guards (JVM, 62 new; 112 total).** `EventQueueTest` (31), `EventPayloadTest` (4), `ApiClientRetryTest` (9, real `HttpURLConnection` against
+`TestHttpResponder`, a raw-socket server — android.jar has no `com.sun.net.httpserver`), `KnownDeviceAndEdgeTest` (8,
+incl. a real ApiClient refresh / sign-in against a cf 403 whose body even says `INVALID_REFRESH_TOKEN`),
+`PushAndLinksTest` (10).
+
+**LIVE run against STAGING (`LiveStagingTest`, s58.402).** SKIPPED unless `SENDORA_LIVE=1`; key = `SENDORA_PK` from
+`.env.e2e.local` (must be `pk_dev_`; `pk_prod_` / `pk_live_` refused; base URL is a constant
+`https://api-dev.sendoracloud.com`, never an input; the key/tokens are never printed — evidence lines only). Run:
+`set -a; . ./.env.e2e.local; set +a; SENDORA_LIVE=1 ./gradlew testDebugUnitTest --tests '*LiveStagingTest*' --rerun
+--no-daemon` (`--rerun`: env is not a task input, a cached pass would replay). Drives `buildEventPayload` → the real
+`EventQueue` → the same send `flushEvents` makes; `SendoraCloudAuth` / `SendoraCloudLinks` / `SendoraCloudPush` over the
+real `ApiClient`. First run (2026-10-18), all PASS: 250 events → 100/100/50 (≤ 38.6 KB, 201 ×3, count 250, no nulls) and
+a raw `projectId:null` → **422** (the M2 proof); 12 × 8 KB → 7 + 5 (57.9 KB / 41.4 KB); one schema-bad event (eventType
+200 chars) among 10 good → 422 bisected 11→6→3→1 and dropped, a 70 KB event → 413 alone and dropped, 10 accepted, 9
+POSTs in one flush; real 429 (lane exhausted with 224 raw requests) → Retry-After 1 s, the queue waited 1.2 s, 0
+attempts spent, delivered on the next POST; guest → signUp → signIn#1 (no kdt sent, staging returned one, stored under
+sha256(email), no raw email on disk) → signIn#2 sent it → resetSession kept it → deleteAccount (`purged`) removed it;
+push `/push/tokens` 2xx with `Authorization: Bearer`; link mint `lrt_…` kept → revoke body `{revokeToken}` → `final:
+true`, forgotten. ⚠ Not live-testable here: the `SendoraCloud.init` wiring itself (needs a Context), Android's own
+`org.json` null behaviour (JVM omits nulls — the raw-null request stands in), `cf-mitigated` (staging is nginx, no CF
+challenge), 503/52x and MFA.
+
+**Mutation record** (cp backup → mutate → `testDebugUnitTest` → cp restore, `filecmp` byte-identical each time):
+
+| # | mutation | red |
+|---|---|---|
+| M1 | whole queue as one batch | 9 |
+| M2 | permanent 4xx kept (no DROP) | 8 |
+| M4 | no attempt cap | 1 |
+| M5 | offline spends the budget | 2 |
+| M6 | backoff gate ignored | 2 |
+| M7 | Retry-After ignored | 9 |
+| M8 | server wait uncapped | 2 |
+| M9 | no 60 s edge floor | 2 |
+| M10 | fixed doubling, not full jitter | 2 |
+| M11 | 429 holds nothing | 2 |
+| M12 | 429 hold unclamped | 1 |
+| M13 | 503 ignores Retry-After | 1 |
+| M14 | cf challenge returned as a refusal | 2 |
+| M15 | plain 4xx trips the breaker | 2 |
+| M16 | null errorStream read (bodiless 4xx) | 1 |
+| M17 | header-only Retry-After not stamped | 1 |
+| M18 | kdt not sent on /login | 4 |
+| M19 | kdt cleared by signOut | 4 |
+| M21 | MFA email not remembered | 1 (0 in round 1 — the test fell back to `data.user.email`; strengthened) |
+| M22 | email stored in clear | 1 |
+| M23 | email not normalised | 1 |
+| M24 | kdt map unbounded | 1 |
+| M25 | oversized kdt kept | 1 |
+| M26 | push without Bearer | 1 |
+| M27 | revokeToken not kept | 6 |
+| M28 | revoke ignores kept token | 2 |
+| M29 | kept token not forgotten | 1 |
+| M30 | edge challenge -> UNAUTHORIZED | 1 |
+| M31 | revoke-token map unbounded | 1 |
+| M32 | 4.27.0 constructor dropped | 1 |
+| M33 | final not read | 1 |
+| N1 | no byte budget | 4 |
+| N2 | no bisection (multi-event 400/413/422 dropped) | 4 |
+| N3 | IDENTITY_UNVERIFIED permanent | 1 |
+| N4 | no null compaction in the queue | 1 |
+| N5 | payload writes null projectId | 1 |
+| N6 | reset clears kdt | 1 |
+| N7 | deleteAccount keeps kdt | 1 |
+| N8 | deleteAccount forgets every account | 1 |
+| N9 | Retry-After overflow | 1 |
+| N10 | screen names unbounded | 1 |
+| P1 | identity-rejected not kept | 2 |
+| P2 | code ignored | 1 |
+| P3 | no reason fallback | 1 |
+| P4 | reason read even with a code | 1 |
+| P5 | kept events spend no attempt | 2 |
+| P6 | pass continues after kept | 2 |
+| R1 | edge challenge spends budget | 2 |
+| R2 | 429 spends budget | 1 |
+| R3 | Cloudflare 52x/530 spend budget | 1 |
+| R4 | cap snaps back after a lone drop | 1 |
+| R5 | no POST budget | 1 |
+| R6 | no backoff after the budget | 1 |
+| R7 | no 5xx bisection | 1 |
+| R8 | 5xx halves on the first failure | 3 |
+| R9 | no doubling back after success | 3 |
+| R10 | token not attached at send | 1 |
+| R11 | decorated bytes not counted | 1 |
+| R12 | token attached to any user's event | 1 |
+| R13 | lone event to /events | 1 |
+
+**60 / 60 red** — the WHOLE set re-run after round 3 at 112 tests (cp backup under a path-unique name → mutate → suite → restore, byte-identical each). M3 (cf → DROP) is superseded by R1; M20 / N11 by N6 / R9 (the rules they guarded changed). ⚠ Deviations: 429 whole-client hold clamped to 60 s (a per-route 429 — support's per-ticket 600 s —
+must not black out events + refresh); offline does not spend the attempt budget; the new revoke overload takes
+`revokeToken` without a default (a default would make `revoke(sc) { }` ambiguous with the 4.27.0 overload).
+⚠ Not mirror-published; README pin / `SDK_RELEASES` / snippets / golden test are the coordinator's.
+
 ## 4.27.0 — Support parity with RN 1.42.0 (s58.376)
 
 `SendoraCloudSupport.kt`: `createTicket` / `listMyTickets` / `getMyTicket` / `replyToMyTicket` (suspend, through

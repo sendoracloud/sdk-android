@@ -2,7 +2,8 @@ package com.sendoracloud.sdk
 
 import android.content.res.Resources
 import android.net.Uri
-import com.sendoracloud.sdk.internal.ApiClient
+import com.sendoracloud.sdk.internal.PlainStore
+import com.sendoracloud.sdk.internal.RichTransport
 import com.sendoracloud.sdk.internal.SendoraCloudLogger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -10,6 +11,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.TimeZone
@@ -26,16 +29,23 @@ import java.util.concurrent.CopyOnWriteArrayList
  *                                              (auto-probes Play Install Referrer
  *                                              + canonical fingerprint).
  *   • [onLinkOpened]                        — observer (warm + deferred).
- *   • [revoke]                              — soft-delete.
+ *   • [revoke]                              — final with the mint's revokeToken
+ *                                              (kept on the device, 4.28.0), else soft.
  *   • [getStats]                            — totals + breakdowns.
  *   • [computeDeviceFingerprint] (static)   — canonical recipe matching iOS / RN.
  *   • [LinkError]                           — typed errors with codes.
  */
 class SendoraCloudLinks internal constructor(
-    private val client: ApiClient,
+    private val client: RichTransport,
     private val packageName: String?,
     private val linkHosts: List<String>,
     private val scope: CoroutineScope,
+    /**
+     * 4.28.0 — where the mint's `revokeToken`s are kept (shortcode → token,
+     * newest 200, the plain `sendora_sdk` prefs under [REVOKE_TOKENS_KEY]).
+     * Null = remember nothing (the caller passes the token to [revoke]).
+     */
+    private val revokeTokenStore: PlainStore? = null,
 ) {
 
     // ---- typed errors ------------------------------------------------
@@ -100,7 +110,38 @@ class SendoraCloudLinks internal constructor(
         val androidDeepLinkPath: String?,
         val fallbackUrl: String,
         val linkData: Map<String, Any>,
-    )
+        /**
+         * 4.28.0 — the mint's `lrt_…` token (server F34). Presenting it makes a
+         * [revoke] FINAL (never reactivatable); without it a revoke is soft.
+         * The SDK keeps it on the device for you; it is here so a server that
+         * owns the link can store it too. Null when the server sent none.
+         */
+        val revokeToken: String? = null,
+    ) {
+        /** The 4.27.0 constructor, kept so code compiled against it still links (binary compatibility). */
+        constructor(
+            id: String,
+            shortcode: String,
+            url: String,
+            iosDeepLinkPath: String?,
+            androidDeepLinkPath: String?,
+            fallbackUrl: String,
+            linkData: Map<String, Any>,
+        ) : this(id, shortcode, url, iosDeepLinkPath, androidDeepLinkPath, fallbackUrl, linkData, null)
+
+        /** Never prints the token. */
+        override fun toString(): String =
+            "LinkCreateResult(id=$id, shortcode=$shortcode, url=$url, iosDeepLinkPath=$iosDeepLinkPath, " +
+                "androidDeepLinkPath=$androidDeepLinkPath, fallbackUrl=$fallbackUrl, linkData=$linkData, " +
+                "revokeToken=${if (revokeToken == null) "null" else "<redacted>"})"
+    }
+
+    /**
+     * 4.28.0 — what [revoke] reports. [final] = true when the server accepted a
+     * revokeToken (the link can never be reactivated); false = a soft revoke a
+     * project member can undo from the dashboard.
+     */
+    data class LinkRevokeResult(val shortcode: String, val final: Boolean)
 
     data class LinkOpenedEvent(
         val shortcode: String,
@@ -301,7 +342,7 @@ class SendoraCloudLinks internal constructor(
     private suspend fun doCreate(input: LinkCreateInput): Result<LinkCreateResult> {
         val rich = client.requestWithDetails("POST", "/sdk/links", buildCreateBody(input))
         if (rich.statusCode !in 200..299) {
-            return Result.failure(mapError(rich.statusCode, rich.errorCode, rich.errorMessage))
+            return Result.failure(mapError(rich))
         }
         @Suppress("UNCHECKED_CAST")
         val data = rich.body?.get("data") as? Map<String, Any?>
@@ -314,6 +355,8 @@ class SendoraCloudLinks internal constructor(
         }
         @Suppress("UNCHECKED_CAST")
         val linkData = (data["linkData"] as? Map<String, Any>) ?: emptyMap()
+        val revokeToken = (data["revokeToken"] as? String)?.takeIf { it.isNotEmpty() && it.length <= MAX_REVOKE_TOKEN_LENGTH }
+        if (revokeToken != null) rememberRevokeToken(shortcode, revokeToken)
         return Result.success(LinkCreateResult(
             id = id,
             shortcode = shortcode,
@@ -322,7 +365,50 @@ class SendoraCloudLinks internal constructor(
             androidDeepLinkPath = data["androidDeepLinkPath"] as? String,
             fallbackUrl = fallback,
             linkData = linkData,
+            revokeToken = revokeToken,
         ))
+    }
+
+    // ---- revoke tokens (4.28.0) --------------------------------------
+
+    private val revokeTokenLock = Any()
+
+    private fun readRevokeTokens(): List<Pair<String, String>> {
+        val raw = revokeTokenStore?.plainGet(REVOKE_TOKENS_KEY) ?: return emptyList()
+        return runCatching {
+            val array = JSONArray(raw)
+            (0 until array.length()).mapNotNull { i ->
+                val o = array.optJSONObject(i) ?: return@mapNotNull null
+                val sc = o.optString("s").takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+                val t = o.optString("t").takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+                sc to t
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun writeRevokeTokens(entries: List<Pair<String, String>>) {
+        val store = revokeTokenStore ?: return
+        if (entries.isEmpty()) {
+            store.plainPut(REVOKE_TOKENS_KEY, null)
+            return
+        }
+        val array = JSONArray()
+        entries.forEach { (sc, t) -> array.put(JSONObject().put("s", sc).put("t", t)) }
+        store.plainPut(REVOKE_TOKENS_KEY, array.toString())
+    }
+
+    private fun rememberRevokeToken(shortcode: String, token: String) = synchronized(revokeTokenLock) {
+        writeRevokeTokens((listOf(shortcode to token) + readRevokeTokens().filter { it.first != shortcode }).take(MAX_REVOKE_TOKENS))
+    }
+
+    private fun forgetRevokeToken(shortcode: String) = synchronized(revokeTokenLock) {
+        val current = readRevokeTokens()
+        if (current.any { it.first == shortcode }) writeRevokeTokens(current.filter { it.first != shortcode })
+    }
+
+    /** The token this device kept for [shortcode] from its mint, if any. */
+    fun storedRevokeToken(shortcode: String): String? = synchronized(revokeTokenLock) {
+        readRevokeTokens().firstOrNull { it.first == shortcode }?.second
     }
 
     // ---- warm path ---------------------------------------------------
@@ -411,17 +497,43 @@ class SendoraCloudLinks internal constructor(
 
     // ---- revoke ------------------------------------------------------
 
+    /**
+     * Revoke a link (4.27.0 signature). Since 4.28.0 it presents the
+     * revokeToken this device kept from the mint, which makes the revoke FINAL;
+     * a link minted elsewhere (no token kept) is revoked soft, as before. Use
+     * the overload with `revokeToken` to read [LinkRevokeResult.final].
+     */
     fun revoke(shortcode: String, onResult: (Result<Unit>) -> Unit) {
+        revoke(shortcode, null) { r -> onResult(r.map { }) }
+    }
+
+    /**
+     * Revoke a link. [revokeToken] = the mint's token (null → the one this
+     * device kept, if any). With a token the revoke is FINAL; without one it
+     * is soft. A wrong token → `UNAUTHORIZED` (403) and nothing changes. On
+     * success the kept token is forgotten.
+     */
+    fun revoke(shortcode: String, revokeToken: String?, onResult: (Result<LinkRevokeResult>) -> Unit) {
         if (!SHORTCODE_RE.matches(shortcode)) {
             onResult(Result.failure(LinkError(LinkErrorCode.INVALID_INPUT, "'$shortcode' is not a valid shortcode")))
             return
         }
         scope.launch {
-            val rich = client.requestWithDetails("POST", "/sdk/links/$shortcode/revoke", emptyMap())
-            withContext(Dispatchers.Main) {
-                if (rich.statusCode in 200..299) onResult(Result.success(Unit))
-                else onResult(Result.failure(mapError(rich.statusCode, rich.errorCode, rich.errorMessage)))
+            val token = revokeToken?.takeIf { it.isNotEmpty() } ?: storedRevokeToken(shortcode)
+            val body: Map<String, Any?> = if (token != null) mapOf("revokeToken" to token) else emptyMap()
+            val rich = client.requestWithDetails("POST", "/sdk/links/$shortcode/revoke", body)
+            val result = if (rich.statusCode in 200..299 && !rich.cfMitigated) {
+                forgetRevokeToken(shortcode)
+                @Suppress("UNCHECKED_CAST")
+                val data = rich.body?.get("data") as? Map<String, Any?>
+                Result.success(LinkRevokeResult(
+                    shortcode = data?.get("shortcode") as? String ?: shortcode,
+                    final = data?.get("final") as? Boolean == true,
+                ))
+            } else {
+                Result.failure(mapError(rich))
             }
+            withContext(Dispatchers.Main) { onResult(result) }
         }
     }
 
@@ -436,7 +548,7 @@ class SendoraCloudLinks internal constructor(
             val rich = client.requestWithDetails("GET", "/sdk/links/$shortcode/stats", null)
             if (rich.statusCode !in 200..299) {
                 withContext(Dispatchers.Main) {
-                    onResult(Result.failure(mapError(rich.statusCode, rich.errorCode, rich.errorMessage)))
+                    onResult(Result.failure(mapError(rich)))
                 }
                 return@launch
             }
@@ -469,6 +581,13 @@ class SendoraCloudLinks internal constructor(
 
     // ---- error mapping ----------------------------------------------
 
+    private fun mapError(rich: com.sendoracloud.sdk.internal.ApiClient.RichResponse): LinkError {
+        // ⚠ 4.28.0: an edge challenge (`cf-mitigated`) arrives as a 403 / 503 the
+        // backend never saw — NETWORK (retry later), never UNAUTHORIZED.
+        if (rich.cfMitigated) return LinkError(LinkErrorCode.NETWORK, rich.errorMessage ?: "Edge challenge", rich.statusCode)
+        return mapError(rich.statusCode, rich.errorCode, rich.errorMessage)
+    }
+
     private fun mapError(status: Int, code: String?, message: String?): LinkError {
         val msg = message ?: "HTTP $status"
         return when {
@@ -496,6 +615,15 @@ class SendoraCloudLinks internal constructor(
 
     companion object {
         private val SHORTCODE_RE = Regex("^[a-z0-9-]{3,20}$")
+
+        /** 4.28.0 — plain-prefs key for the shortcode → revokeToken map (additive; not an auth key). */
+        internal const val REVOKE_TOKENS_KEY = "link_revoke_tokens"
+
+        /** At most this many revoke tokens are kept; the oldest falls off. */
+        internal const val MAX_REVOKE_TOKENS = 200
+
+        /** The backend's `sdkRevokeSchema` accepts ≤ 200 chars. */
+        private const val MAX_REVOKE_TOKEN_LENGTH = 200
 
         /**
          * Extract a shortcode from a Sendora URI.
