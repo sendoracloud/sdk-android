@@ -113,6 +113,26 @@ class KnownDeviceAndEdgeTest {
         assertTrue(rig.store.writesTo(AuthKeys.KNOWN_DEVICE_TOKENS).isEmpty())
     }
 
+    // s58.405: a lock is retryable only when the server said when it lifts. The per-network and 20-an-hour waits send
+    // `details.retryAfterSeconds`; the 100-failure hard stop sends none and needs a password reset or another sign-in.
+    @Test
+    fun `ACCOUNT_LOCKED is retryable only with a wait`() = runBlocking {
+        val rig = Rig()
+        rig.transport.enqueue(
+            "/auth-service/login",
+            errorEnvelope("ACCOUNT_LOCKED", 403, details = mapOf("retryAfterSeconds" to 900)),
+            errorEnvelope("ACCOUNT_LOCKED", 403),
+        )
+        val cooling = rig.auth.signIn("b@x.io", "pw").exceptionOrNull() as SendoraCloudAuthError
+        assertEquals(SendoraCloudAuthErrorKind.ACCOUNT_LOCKED, cooling.kind)
+        assertEquals(900, cooling.retryAfterSeconds)
+        assertTrue("a cool-off lifts on its own", cooling.retryable)
+        val hardStop = rig.auth.signIn("b@x.io", "pw").exceptionOrNull() as SendoraCloudAuthError
+        assertEquals(SendoraCloudAuthErrorKind.ACCOUNT_LOCKED, hardStop.kind)
+        assertNull(hardStop.retryAfterSeconds)
+        assertFalse("the hard stop does not lift with time", hardStop.retryable)
+    }
+
     @Test
     fun `the map keeps the newest 20 accounts`() {
         var entries = emptyList<KnownDeviceTokens.Entry>()

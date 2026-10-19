@@ -43,7 +43,13 @@ without ever failing a build. It caught exactly this on the 4.18.0 bump.
 
 
 
-## 4.30.0 (s58.405) — built, not published
+## 4.31.0 (s58.405-j) — built, not published — `account_locked` is retryable only with a wait
+
+`retryable` for `account_locked` = `retryAfterSeconds` present. The server's per-network and 20/hour waits send one;
+the 100-failure hard stop sends none and does not lift with time (reset the password / sign in another way). Every
+other kind unchanged. Guard `KnownDeviceAndEdgeTest` "ACCOUNT_LOCKED is retryable only with a wait" (real `signIn` over the harness). `SendoraCloudAuthErrorKind.ACCOUNT_LOCKED.retryable` stays true (kind level, documented); the ERROR's `retryable` decides. `PasskeyError` never carries `ACCOUNT_LOCKED`; mutation (always true for `account_locked`) → 1 red.
+
+## 4.30.0 (s58.405) — published
 
 `Storage.saveEventQueue` keeps `userId` / `properties.traits` (same drop as iOS) and strips `identityToken` (trackEvent stamps it at enqueue — it WAS written to plain prefs); `validateProperties` counts UTF-8 bytes (it counted chars; a behaviour change for 32 KB+ multi-byte properties); key error says 19+ chars. Guards `PersistedQueueIdentityTest` (3) + `ValidatorBytesTest` (3; ⚠ JVM org.json escapes U+2000–20FF like "€" as `\u20ac`, Android does not — byte tests use "中"); 147 JVM tests (8 live skipped).
 

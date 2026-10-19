@@ -145,7 +145,12 @@ enum class SendoraCloudAuthErrorKind {
     CONFIG,
     UNKNOWN;
 
-    /** True when retrying the SAME input can plausibly succeed later. */
+    /**
+     * True when retrying the SAME input can plausibly succeed later, for this kind
+     * in general. ⚠ [ACCOUNT_LOCKED] is true here but an individual error decides
+     * with its wait: [SendoraCloudAuthError.retryable] is false for a lock with no
+     * `retryAfterSeconds` (the 100-failure hard stop, which does not lift with time).
+     */
     val retryable: Boolean
         get() = this == NETWORK || this == SERVER || this == RATE_LIMITED || this == ACCOUNT_LOCKED
 
@@ -211,12 +216,18 @@ sealed class SendoraCloudAuthError(
      * Seconds to wait before retrying, when the server told us (429 backoff, or
      * an ACCOUNT_LOCKED cool-off). Absent means "no server-provided hint" — for
      * [SendoraCloudAuthErrorKind.ACCOUNT_LOCKED] specifically, absent means the
-     * lock does NOT expire on its own and needs support.
+     * lock does NOT lift with time: reset the password, or sign in another way
+     * (magic link, email code, social), to continue — and [retryable] is false.
      */
     val retryAfterSeconds: Int? = null,
 ) : Throwable(message) {
-    /** True when retrying the SAME input can plausibly succeed later. */
-    val retryable: Boolean get() = kind.retryable
+    /**
+     * True when retrying the SAME input can plausibly succeed later. An
+     * ACCOUNT_LOCKED error is retryable ONLY when the server said when the lock
+     * lifts ([retryAfterSeconds]); the 100-failure hard stop carries none.
+     */
+    val retryable: Boolean
+        get() = if (kind == SendoraCloudAuthErrorKind.ACCOUNT_LOCKED) retryAfterSeconds != null else kind.retryable
 
     class EmailAlreadyTaken(message: String, code: String? = null, status: Int? = null) :
         SendoraCloudAuthError(message, SendoraCloudAuthErrorKind.INVALID_CREDENTIAL, code, status)

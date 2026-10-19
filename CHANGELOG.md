@@ -1,5 +1,15 @@
 # Changelog
 
+## 4.31.0 — `ACCOUNT_LOCKED` is retryable only with a wait
+
+- **Behaviour change: an `account_locked` error is retryable only when the server said when the lock lifts.**
+  `SendoraCloudAuthError.retryable` was always true for `account_locked`. The server sends `retryAfterSeconds` for the per-network wait and the
+  20-failures-an-hour wait, which lift on their own; after 100 failures in a row it sends none, and that lock does not
+  lift with time — the user has to reset the password, or sign in another way (magic link, email code, social). That
+  error now reports `retryable` false. ⚠ If you retry whenever `retryable` is true, the hard stop is no longer retried;
+  if you show a countdown, show a "reset your password" path instead when there is no wait. Every other kind is
+  unchanged.
+
 ## 4.30.0 — the identity token stays off disk; queued events keep their user; properties are measured in bytes
 
 - **License: Apache-2.0.** The package now ships the full license text in `LICENSE` (none shipped before).
