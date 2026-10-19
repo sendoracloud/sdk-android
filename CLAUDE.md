@@ -134,6 +134,34 @@ true`, forgotten. ⚠ Not live-testable here: the `SendoraCloud.init` wiring its
 `org.json` null behaviour (JVM omits nulls — the raw-null request stands in), `cf-mitigated` (staging is nginx, no CF
 challenge), 503/52x and MFA.
 
+**T4 (real 429) must be deterministic (s58.403).** The staging ingest lane refills ~3 a second, so one SDK POST could
+slip between raw requests and get a 201 — the 4.28.1 release gate failed that way. The harness keeps eight background
+threads posting raw (no SDK code) and only then hands the SDK events, re-flushing ≤ 20 times until one of ITS OWN POSTs
+is refused 429; a missing backoff timestamp prints "n/a" rather than a negative wait.
+
+**⚠⚠ The B9 publish gate now drives THIS SDK (`LiveLifecycleTest` + `LiveStagingTest`, contract 2 of
+`scripts/e2e/live-run-contract.mjs`).** The old marker came from the WEB SDK whatever `--sdk` said — Android 4.26–4.28
+"passed" without one line of Kotlin meeting a server. `LiveLifecycleTest` ports `scripts/e2e/auth-lifecycle.mts` step for
+step (A1–A7, B1–B5, W1-a/b/c/d/g/g2/e, B8, B9) over the real `SendoraCloudAuth` / `ApiClient`, with a `CookieManager`
+installed as the default `CookieHandler` (a phone's jar — s58.360) and `RecordingStore` as the disk (one instance = one
+device: the cold start and the withheld hydrate are real). Play Games stands in for Game Center in W1-g (iOS-only);
+W1-e's "anonymous_id kept" is not portable (Android's device id lives in the Context-backed `Storage`). Both suites write
+`SENDORA_LIVE_RESULT` after every step through `LiveReport` (`LiveSupport.kt`): merged by step id under the same nonce,
+so suite order does not matter; `sdkReportedVersion` read by reflection off `SdkVersionKt`; details scrubbed of
+emails / JWTs / keys / `kdt1.` / `lrt_`. `LiveEnv` refuses any host but `api-dev.sendoracloud.com` and any
+`pk_prod_` / `pk_live_` / `sk_prod_` / `sk_live_` credential. `build.gradle.kts` forwards the `SENDORA_*` env to the test
+JVM and marks a live run never up-to-date. Run:
+`set -a; . ./.env.e2e.local; set +a; SENDORA_LIVE=1 SENDORA_API=https://api-dev.sendoracloud.com SENDORA_LIVE_NONCE=…
+SENDORA_LIVE_RESULT=… ./gradlew testDebugUnitTest --tests '*Live*' --rerun --no-daemon -q`. First full run
+(2026-10-19): `judgeLiveRun` ok — 28 / 28 required steps pass, none exempt.
+⚠⚠ **It found a real bug on its first run: `claimHeldGuest()` / `merge()` had NEVER worked on Android.** `POST
+/auth-service/merge` sent `{ anonRefreshToken, refreshToken }`; `authMergeSchema` is `{ anonymousRefreshToken,
+targetRefreshToken }` → 400 VALIDATION_ERROR on every claim. Two unit suites asserted the wrong names (a test that
+restates the wire contract only proves the SDK agrees with itself). Fixed; `WireSchemaContractTest` now reads the keys
+out of `packages/shared/src/types/auth-service.ts` and compares the SENT body (merge + guest discard). Mutation S1
+(revert the names) → 3 red. ⚠ The raw `projectId: null` probe in T1 is evidence only: staging refused it (422) on
+10-18 and accepts it (201) on 10-19 — the server was made tolerant; the SDK's own guard is the no-null-in-the-map check.
+
 **Mutation record** (cp backup → mutate → `testDebugUnitTest` → cp restore, `filecmp` byte-identical each time):
 
 | # | mutation | red |

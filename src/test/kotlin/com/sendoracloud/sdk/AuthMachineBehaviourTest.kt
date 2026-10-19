@@ -258,13 +258,13 @@ class AuthMachineBehaviourTest {
         rig.transport.enqueue("/auth-service/merge", okEnvelope(mapOf("mergedUserId" to uB.id, "deletedAnonymousId" to uA.id, "tokens" to mapOf("accessToken" to jwt(uB.id, "sid-B", anonymous = false), "refreshToken" to "rB2", "expiresIn" to 900))))
         rig.auth.merge("rA-journalled").getOrThrow()
         assertEquals("the held token is refreshed first", "rA-now", rig.transport.sent("/auth-service/token/refresh").single().body!!["refreshToken"])
-        assertEquals("rA-next", rig.transport.sent("/auth-service/merge").single().body!!["anonRefreshToken"])
+        assertEquals("rA-next", rig.transport.sent("/auth-service/merge").single().body!!["anonymousRefreshToken"])
         assertEquals(0, rig.auth.heldGuests().size)
         assertTrue(rig.eventNames.contains("guest_released"))
         // A token no slot knows → raw /merge, no refresh
         rig.transport.enqueue("/auth-service/merge", okEnvelope(mapOf("mergedUserId" to uB.id, "tokens" to mapOf("accessToken" to jwt(uB.id, "sid-B", anonymous = false), "refreshToken" to "rB3", "expiresIn" to 900))))
         rig.auth.merge("rX").getOrThrow()
-        assertEquals("rX", rig.transport.sent("/auth-service/merge").last().body!!["anonRefreshToken"])
+        assertEquals("rX", rig.transport.sent("/auth-service/merge").last().body!!["anonymousRefreshToken"])
         assertEquals(1, rig.transport.count("/auth-service/token/refresh"))
         assertEquals("rB3", rig.auth.getRefreshToken())
     }

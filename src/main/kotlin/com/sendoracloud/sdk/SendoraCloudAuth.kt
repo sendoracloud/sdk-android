@@ -2359,11 +2359,17 @@ class SendoraCloudAuth internal constructor(
         }
     }
 
-    /** `POST /merge { anonRefreshToken, refreshToken }` → install the rotated TARGET pair (same user), `UserUpdated(MERGE)`. */
+    /**
+     * `POST /merge { anonymousRefreshToken, targetRefreshToken }` → install the rotated TARGET pair (same user),
+     * `UserUpdated(MERGE)`. ⚠ 4.28.1 (found by the first Android live run): the body said `{ anonRefreshToken,
+     * refreshToken }`, which `authMergeSchema` refuses (400 VALIDATION_ERROR) — `claimHeldGuest()` and `merge()`
+     * had never worked against a real server; the unit suites asserted the wrong names. Pinned to the shared
+     * schema's keys by `WireSchemaContractTest`.
+     */
     private suspend fun mergeRaw(anonRefreshToken: String, expect: String?, releaseIndex: Int? = null): Result<ClaimResult> {
         val current = slot as? AuthSlot.Session
             ?: return Result.failure(SendoraCloudAuthError.Unauthorized("merge requires an identified session"))
-        val response = client.post("/auth-service/merge", mapOf("anonRefreshToken" to anonRefreshToken, "refreshToken" to current.record.refreshToken))
+        val response = client.post("/auth-service/merge", mapOf("anonymousRefreshToken" to anonRefreshToken, "targetRefreshToken" to current.record.refreshToken))
         parseError(response)?.let { return Result.failure(it) }
         @Suppress("UNCHECKED_CAST")
         val data = response?.get("data") as? Map<String, Any?>

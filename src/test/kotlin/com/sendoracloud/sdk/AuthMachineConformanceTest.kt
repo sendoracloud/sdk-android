@@ -729,7 +729,7 @@ class AuthMachineConformanceTest {
                 }
                 r.transport.on("/auth-service/merge") { req ->
                     assertEquals("the rotation is PERSISTED into the slot BEFORE /merge", "rG1'", r.store.heldJson(0)!!.getString("refreshToken"))
-                    assertEquals("rG1'", req.body!!["anonRefreshToken"]); assertEquals("rB", req.body!!["refreshToken"])
+                    assertEquals("rG1'", req.body!!["anonymousRefreshToken"]); assertEquals("rB", req.body!!["targetRefreshToken"])
                     okEnvelope(mapOf("mergedUserId" to uB.id, "deletedAnonymousId" to "g1", "eventsReassigned" to 3, "tokens" to mapOf("accessToken" to tokB("sid-B2"), "refreshToken" to "rB2", "expiresIn" to 900)))
                 }
                 val claim = r.auth.claimHeldGuest("g1").getOrThrow()

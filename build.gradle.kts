@@ -37,6 +37,16 @@ dependencyLocking {
     lockAllConfigurations()
 }
 
+// ADR-033 B9 live run (LiveLifecycleTest + LiveStagingTest, skipped unless SENDORA_LIVE=1).
+// The test JVM inherits the build's environment; these are forwarded explicitly so the contract does not hang on
+// that default, and a live run is NEVER up-to-date (env vars are not task inputs — a cached pass would replay
+// without one request reaching staging). The values are never declared as inputs, so no key reaches a cache key.
+tasks.withType<Test>().configureEach {
+    listOf("SENDORA_LIVE", "SENDORA_API", "SENDORA_PK", "SENDORA_LOG_AUTH", "SENDORA_LIVE_NONCE", "SENDORA_LIVE_RESULT", "SENDORA_ORG_ID")
+        .forEach { k -> System.getenv(k)?.let { v -> environment(k, v) } }
+    outputs.upToDateWhen { System.getenv("SENDORA_LIVE") != "1" }
+}
+
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.lifecycle:lifecycle-process:2.8.0")
@@ -73,7 +83,7 @@ afterEvaluate {
                 groupId = "com.sendoracloud"
                 artifactId = "sdk-android"
                 // Keep in lockstep with internal/SdkVersion.kt SDK_VERSION (ADR-023 §7).
-                version = "4.28.0"
+                version = "4.28.1"
                 pom {
                     name.set("Sendora Cloud Android SDK")
                     description.set("Deep linking, attribution, and event tracking for Android.")

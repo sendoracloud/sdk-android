@@ -63,8 +63,8 @@ import java.util.concurrent.atomic.AtomicInteger
 class LiveStagingTest {
 
     companion object {
-        /** STAGING only (`--env dev`, ADR-017). Never an input. */
-        const val STAGING = "https://api-dev.sendoracloud.com"
+        /** STAGING only (`--env dev`, ADR-017): `SENDORA_API`, refused unless its host is api-dev (LiveEnv). */
+        val STAGING: String get() = LiveEnv.api
     }
 
     private lateinit var key: String
@@ -73,12 +73,10 @@ class LiveStagingTest {
 
     @Before
     fun guard() {
-        assumeTrue("live run: set SENDORA_LIVE=1", System.getenv("SENDORA_LIVE") == "1")
-        val k = System.getenv("SENDORA_PK") ?: ""
-        // ⚠ Never echo the key — only its shape.
-        require(!k.startsWith("pk_prod_") && !k.startsWith("pk_live_")) { "refusing a production key" }
-        require(k.startsWith("pk_dev_")) { "SENDORA_PK must be a staging pk_dev_ key" }
-        key = k
+        assumeTrue("live run: set SENDORA_LIVE=1", LiveEnv.enabled)
+        // ⚠ Never echo the key — LiveEnv refuses pk_prod_ / pk_live_ and a non-staging host.
+        key = LiveEnv.key
+        LiveEnv.api
         Dispatchers.setMain(Dispatchers.Unconfined)
     }
 
@@ -87,8 +85,23 @@ class LiveStagingTest {
         runCatching { Dispatchers.resetMain() }
     }
 
+    private val recorded = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
+    /** Scenario "4 real 429" → step T4 of the live-run contract (scripts/e2e/live-run-contract.mjs). */
     private fun report(scenario: String, pass: Boolean, evidence: String) {
-        println("LIVE ${if (pass) "PASS" else "FAIL"} $scenario — $evidence")
+        val id = "T" + scenario.substringBefore(' ')
+        recorded += id
+        LiveReport.record(id, pass, evidence, "LiveStagingTest")
+    }
+
+    /** Runs one scenario; a throw before its report line is still recorded as a FAIL for [ids]. */
+    private fun live(vararg ids: String, block: suspend kotlinx.coroutines.CoroutineScope.() -> Unit) = runBlocking {
+        try {
+            block()
+        } catch (t: Throwable) {
+            for (id in ids) if (id !in recorded) LiveReport.record(id, false, "threw ${t.javaClass.simpleName}: ${t.message}", "LiveStagingTest")
+            throw t
+        }
     }
 
     // ─── shared pieces ───────────────────────────────────────────────────────
@@ -167,26 +180,26 @@ class LiveStagingTest {
     // ─── 1 ───────────────────────────────────────────────────────────────────
 
     @Test
-    fun s1_250_events_drain_in_bounded_batch_posts_with_no_null_values() = runBlocking {
+    fun s1_250_events_drain_in_bounded_batch_posts_with_no_null_values() = live("T1") {
         val posts = mutableListOf<Post>()
         val q = liveQueue(ApiClient(STAGING, key), posts)
         repeat(250) { q.add(event("f67.live.small", mapOf("i" to it, "run" to run))) }
         drain(q, 180_000)
         val accepted = posts.filter { it.status in 200..299 }.sumOf { it.count }
-        // The M2 proof: the backend itself refuses the null the JVM serializer would hide.
+        // Evidence only (not a criterion): how the backend treats an explicit null today. It refused it (422) on
+        // 2026-10-18; the server has since been made tolerant (an older SDK's nulls). The SDK guard is `nulls` above.
         val (nullStatus, _) = raw(EVENTS_BATCH_PATH, """{"events":[{"projectId":null,"module":"custom","eventType":"f67.live.null","properties":{}}]}""")
-        val ok = accepted == 250 && posts.all { it.events <= 100 && it.bytes <= 60_000 && it.nulls.isEmpty() } && nullStatus in 400..422
+        val ok = accepted == 250 && posts.all { it.events <= 100 && it.bytes <= 60_000 && it.nulls.isEmpty() }
         report("1 250 events", ok, "posts=${posts.map { "${it.events}ev/${it.bytes}B→${it.status}(count ${it.count})" }}, accepted=$accepted, nullPaths=${posts.flatMap { it.nulls }.distinct()}, raw projectId:null → HTTP $nullStatus")
         assertEquals(250, accepted)
         assertTrue(posts.all { it.events <= 100 && it.bytes <= 60_000 })
         assertTrue("no null value in any body", posts.all { it.nulls.isEmpty() })
-        assertTrue("the backend refuses projectId:null (HTTP $nullStatus)", nullStatus in 400..422)
     }
 
     // ─── 2 ───────────────────────────────────────────────────────────────────
 
     @Test
-    fun s2_eight_kb_events_chunk_under_60000_bytes() = runBlocking {
+    fun s2_eight_kb_events_chunk_under_60000_bytes() = live("T2") {
         val posts = mutableListOf<Post>()
         val q = liveQueue(ApiClient(STAGING, key), posts)
         val blob = "x".repeat(7_900)
@@ -203,7 +216,7 @@ class LiveStagingTest {
     // ─── 3 ───────────────────────────────────────────────────────────────────
 
     @Test
-    fun s3_one_bad_event_among_good_ones_is_the_only_drop() = runBlocking {
+    fun s3_one_bad_event_among_good_ones_is_the_only_drop() = live("T3") {
         val posts = mutableListOf<Post>()
         val q = liveQueue(ApiClient(STAGING, key), posts)
         repeat(5) { q.add(event("f67.live.good", mapOf("i" to it))) }
@@ -264,7 +277,7 @@ class LiveStagingTest {
     }
 
     @Test
-    fun s5_s7_known_device_token_and_push_bearer_live() = runBlocking {
+    fun s5_s7_known_device_token_and_push_bearer_live() = live("T5", "T7") {
         val store = RecordingStore()
         val transport = Recording(ApiClient(STAGING, key))
         val auth = SendoraCloudAuth(
@@ -330,7 +343,7 @@ class LiveStagingTest {
     // ─── 6 ───────────────────────────────────────────────────────────────────
 
     @Test
-    fun s6_link_revoke_token_round_trip() = runBlocking {
+    fun s6_link_revoke_token_round_trip() = live("T6") {
         val plain = RecordingStore()
         val transport = Recording(ApiClient(STAGING, key))
         val links = SendoraCloudLinks(transport, null, emptyList(), CoroutineScope(Dispatchers.IO), plain)
@@ -353,43 +366,73 @@ class LiveStagingTest {
     // ─── 4 (last: it exhausts this machine's ingest lane for up to a minute) ─
 
     @Test
-    fun s9_real_429_waits_retry_after_spends_nothing_then_delivers() = runBlocking {
-        // Stage: exhaust the ingest lane ("ingest";q=200;w=60) with raw requests until the server says 429.
+    fun s9_real_429_waits_retry_after_spends_nothing_then_delivers() = live("T4") {
+        // The ingest lane ("ingest";q=200;w=60) REFILLS (~3/s), so a one-shot exhaustion races: the SDK's single POST
+        // could slip into a refill and get a 201 (the 4.28.1 gate failure). Deterministic instead: keep CONTINUOUS raw
+        // pressure on the lane (fresh connections, no SDK code) and keep handing the SDK events / re-flushing until
+        // one of ITS OWN POSTs is refused 429 (≤ 20 tries) — then judge the wait, the budget and the delivery.
         val one = """{"events":[{"module":"custom","eventType":"f67.live.stage","anonymousId":"f67-live-$run","properties":{}}]}"""
-        val pool = Executors.newFixedThreadPool(12)
-        val seen429 = AtomicInteger(0)
-        val sent = AtomicInteger(0)
-        repeat(260) {
+        val stop = java.util.concurrent.atomic.AtomicBoolean(false)
+        val raws = AtomicInteger(0)
+        val raw429 = AtomicInteger(0)
+        val pressureDeadline = System.currentTimeMillis() + 120_000
+        val pool = Executors.newFixedThreadPool(8)
+        repeat(8) {
             pool.submit {
-                if (seen429.get() < 5) {
+                while (!stop.get() && System.currentTimeMillis() < pressureDeadline) {
                     val (code, _) = runCatching { raw(EVENTS_BATCH_PATH, one) }.getOrDefault(0 to null)
-                    sent.incrementAndGet()
-                    if (code == 429) seen429.incrementAndGet()
+                    raws.incrementAndGet()
+                    if (code == 429) raw429.incrementAndGet() else Thread.sleep(20)
+                    if (code == 429) Thread.sleep(50)
                 }
             }
         }
-        pool.shutdown(); pool.awaitTermination(120, TimeUnit.SECONDS)
-        assertTrue("staging answered 429 after ${sent.get()} raw requests", seen429.get() > 0)
-
         val posts = mutableListOf<Post>()
         val q = liveQueue(ApiClient(STAGING, key), posts)
-        repeat(3) { q.add(event("f67.live.after429", mapOf("i" to it))) }
-        val t0 = System.currentTimeMillis()
-        q.flush()
-        val first = posts.firstOrNull()
-        val attemptsAfter429 = q.attemptCounts()
-        val waitedFor = q.backoffUntil - t0
-        val honoured = first?.status == 429 && first.retryAfter != null && waitedFor >= (first.retryAfter * 1000L) - 1_000L
+        var added = 0
+        var tries = 0
+        var refused: Post? = null
+        var flushStartedAt = 0L
+        var attemptsAt429: List<Int> = emptyList()
+        var backoffAt429 = 0L
+        try {
+            // Let the pressure drain the bucket first (its first ~200 units are a burst), so the SDK's tries start
+            // against a lane that is already refusing — the 20-try bound is then slack, not a coin toss.
+            val drainedBy = System.currentTimeMillis() + 60_000
+            while (raw429.get() == 0 && System.currentTimeMillis() < drainedBy) Thread.sleep(100)
+            while (refused == null && tries < 20 && System.currentTimeMillis() < pressureDeadline) {
+                if (q.count == 0) { q.add(event("f67.live.after429", mapOf("i" to added))); added++ }
+                val wait = q.backoffUntil - System.currentTimeMillis()
+                if (wait > 0) Thread.sleep(wait.coerceAtMost(5_000L))
+                val before = posts.size
+                flushStartedAt = System.currentTimeMillis()
+                q.flush()
+                tries++
+                refused = posts.drop(before).firstOrNull { it.status == 429 }
+                if (refused != null) { attemptsAt429 = q.attemptCounts(); backoffAt429 = q.backoffUntil }
+                else Thread.sleep(250)
+            }
+        } finally {
+            stop.set(true)
+            pool.shutdown(); pool.awaitTermination(30, TimeUnit.SECONDS)
+        }
+        val retryAfter = refused?.retryAfter
+        val waitedFor: Long? = if (refused != null && backoffAt429 > 0L) backoffAt429 - flushStartedAt else null
+        val honoured = refused != null && retryAfter != null && waitedFor != null && waitedFor >= retryAfter * 1000L - 1_000L
         val maxAttempts = mutableListOf<Int>()
         drain(q, 240_000) { maxAttempts += (q.attemptCounts().maxOrNull() ?: 0) }
         val delivered = posts.filter { it.status in 200..299 }.sumOf { it.count }
-        val ok = honoured && attemptsAfter429.all { it == 0 } && maxAttempts.all { it == 0 } && delivered == 3
-        report("4 real 429", ok, "stage: ${sent.get()} raw → ${seen429.get()}×429; first flush HTTP ${first?.status} Retry-After=${first?.retryAfter}s, queue waits ${waitedFor} ms, attempts=$attemptsAfter429 (max during drain ${maxAttempts.maxOrNull()}), then posts=${posts.map { it.status }}, delivered=$delivered after ${System.currentTimeMillis() - t0} ms")
-        assertEquals(429, first?.status)
-        assertNotNull(first?.retryAfter)
+        val noBudget = attemptsAt429.all { it == 0 } && maxAttempts.all { it == 0 }
+        val ok = honoured && noBudget && q.count == 0 && delivered == added
+        report("4 real 429", ok, "pressure: ${raws.get()} raw → ${raw429.get()}×429; SDK refused on try ${if (refused != null) tries else "-"}/20 " +
+            "(HTTP ${refused?.status ?: "none"}, Retry-After=${retryAfter?.let { "${it}s" } ?: "none"}), queue waits " +
+            "${waitedFor?.let { "$it ms" } ?: "n/a (no backoff recorded)"}, attempts at 429=$attemptsAt429 (max during drain ${maxAttempts.maxOrNull() ?: 0}), " +
+            "SDK posts=${posts.map { it.status }}, delivered=$delivered/$added, left=${q.count}")
+        assertNotNull("one of the SDK's own POSTs was refused 429 within 20 tries", refused)
+        assertNotNull("the 429 carried Retry-After", retryAfter)
         assertTrue("waited at least Retry-After", honoured)
-        assertTrue("no attempt spent", attemptsAfter429.all { it == 0 } && maxAttempts.all { it == 0 })
-        assertEquals(3, delivered)
-        assertNull(null)
+        assertTrue("no attempt spent", noBudget)
+        assertEquals("everything handed to the SDK was delivered after the wait", added, delivered)
+        assertEquals(0, q.count)
     }
 }

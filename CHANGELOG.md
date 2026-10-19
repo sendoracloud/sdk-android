@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.28.1 — claimHeldGuest() works
+
+- **Fix: `claimHeldGuest()` and the deprecated `merge()` never worked (4.26.0 – 4.28.0).** They sent the `/auth-service/merge` body under
+  the wrong field names (`anonRefreshToken` / `refreshToken`; the schema is `anonymousRefreshToken` / `targetRefreshToken`), so the server refused every claim (400). Found by the first live run of this SDK against
+  staging; the unit tests had asserted the same wrong names.
+
 ## 4.28.0 — offline backlogs drain; the SDK honours Retry-After; device tokens; final link revokes
 
 Audit F67 (with the server halves of F23, F34, F53). Additive; nothing existing changes shape.
