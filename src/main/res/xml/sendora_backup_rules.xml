@@ -14,9 +14,12 @@
   `EncryptedSharedPreferences` (file `sendora_sdk_secure`) under an Android
   Keystore master key. Keystore keys are non-exportable and are NOT backed up.
   So if these prefs DO ride a cloud backup to a new device, the restored blob is
-  UNDECRYPTABLE — the failure is a lost session, not a leaked credential. That
-  is a real annoyance and is not a security hole, which is why this is guidance
-  rather than something we force.
+  UNDECRYPTABLE — never a leaked credential. ⚠ Until 4.29.0 it was also not "just a lost
+  session": EncryptedSharedPreferences threw AEADBadTagException on every launch, so the SDK
+  refused every sign-in on that device and minted a new device id per launch. Since 4.29.0
+  `Storage.kt` deletes the unreadable file and recreates it once (the device starts as a fresh
+  guest). Excluding the files is still recommended: it avoids that recovery and stops the old
+  device's event queue and first-launch marker from being restored.
 
   ⚠ Sendora's own storage fails CLOSED: if `EncryptedSharedPreferences` cannot
   initialise, `Storage.kt` refuses to persist tokens rather than falling back to
@@ -27,12 +30,14 @@
   and point your manifest at them:
 
       <application
-          android:fullBackupContent="@xml/your_backup_rules"
-          android:dataExtractionRules="@xml/your_extraction_rules"
-          tools:replace="android:fullBackupContent" />
+          android:fullBackupContent="@xml/sendora_backup_rules"
+          android:dataExtractionRules="@xml/sendora_data_extraction_rules" />
 
-  Android 12+ (API 31) reads `dataExtractionRules`; earlier reads
-  `fullBackupContent`. Ship both if you support both.
+  (`tools:replace` is needed only if another library's manifest sets the same attribute.)
+
+  Android 12+ (API 31) reads `dataExtractionRules` (sendora_data_extraction_rules.xml,
+  shipped since 4.29.0); Android 11 and lower read `fullBackupContent` (this file).
+  Set BOTH — minSdk 26 spans both.
 -->
 <full-backup-content>
     <exclude domain="sharedpref" path="sendora_sdk.xml" />

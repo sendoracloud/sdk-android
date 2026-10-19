@@ -42,6 +42,58 @@ under the new one — which corrupts every version-correlated support question
 without ever failing a build. It caught exactly this on the 4.18.0 bump.
 
 
+## 4.29.0 — server consent + feature flags, identify()'s identityToken (s58.404)
+
+**What.** `SendoraCloudServerApis.kt`: `withInputIdentityToken` (pure port of RN `withInputIdentityToken`, RN ≥ 1.43.0),
+`callServer` (2xx → `data`; refusal → `SendoraCloudApiException(operation, status, code)`; null answer → status 0
+`NETWORK`; no transport → `NOT_CONFIGURED` — never a silent null), typed results `ConsentRecordResult` /
+`DeletionRequestResult` / `FlagValue`, and `SendoraCloudFlags` (`SendoraCloud.flags`). `SendoraCloudConsent` gained
+`record` / `requestDeletion`; the local `grant()` / `revoke()` / `isGranted` gate is byte-for-byte the old behaviour.
+Seams (`transportProvider`, `userIdProvider`, `proofProvider`) default to the singleton, so the JVM suite drives them.
+**Token rule:** explicit argument wins; else identify()'s token only when the call's userId equals the userId identify()
+was given WITH that token (`identityTokenUserId` — not `currentUserId`, which a sign-in also rewrites), within the route's
+limit (flags ≤ 128, consent ≤ 256 — the zod `.max`). Flags' userId defaults to the identified user (`currentUserId`);
+consent's does NOT (RN parity: a consent call names its user or no one). In memory only; cleared by `reset()`, the
+auth wipe and an `identify()` without a token. Bodies are built key-by-key, never a null value.
+**Response shapes (read from the routes):** `/feature-flags/evaluate` → `{ key, value, ruleMatched }`;
+`/feature-flags/evaluate-all` → an ARRAY of those (keyed here by `key`; a map is tolerated). ⚠ RN's TypeScript types
+declare `{ value, variant, reason }` and a Record — neither field exists on the wire today; Android reads `ruleMatched`
+into `reason` and leaves `variant` null rather than invent it.
+**Guards.** `ServerApisTest` (8 — the rule through the REAL `identify()` / `reset()` with `isConfigured` set by
+reflection, no-null bodies, decoding, typed errors), `WireSchemaContractTest` +3 (bodies vs `recordConsentSchema`,
+`createDeletionRequestSchema`, `evaluateFlagSchema`, `evaluateAllFlagsSchema` read from `packages/shared/src/types`).
+Live **T8** (`LiveStagingTest.s8_…`): all four calls 2xx on staging; token present for the identified user's record +
+evaluate, absent for another user's deletion request + evaluateAll (a well-formed unprovable HMAC: the server answers
+2xx, unverified). Mutations X1–X12, all red (explicit wins 4, any-user 1, no limit 1, reset keeps 1, tokenless identify
+keeps 1, null in body 1, no userId default 1, refusal swallowed 1, array not decoded 1, ruleMatched ignored 1, wire key
+renamed 2, flag limit 256 1). README section added (snippet gate green).
+
+**4.29.0 consumer-test fixes (s58.404, found on a real emulator — none is visible to a JVM test).** A scratch app
+depending on the mavenLocal AAR, run on `Pixel_3a_API_34` against staging, found three pre-existing defects:
+- **R8.** `compileOnly` installreferrer + play-services-location → AGP 8 R8 "Missing class" ERROR in every minified app
+  without them. `consumer-rules.pro`: `-dontwarn` both + `-keepnames` the two probed classes (so `Class.forName`
+  survives obfuscation when the app has them). `SendoraCloudGeofences.isLocationAvailable(op)` (probed once) guards
+  `refresh` / `stop` / `handleBroadcast` (all threw `NoClassDefFoundError`; `refresh` from a scope with NO exception
+  handler → app crash) and the scope got a handler. Proven: the consumer's minified build passes with NO app-side
+  `-dontwarn`; geofence calls on-device are no-ops. Guard `GeofenceOptionalDepTest` (the lib is absent from the test
+  runtime classpath, like an app without it).
+- **Backup restore.** `EncryptedSharedPreferences.create` on a restored `sendora_sdk_secure.xml` throws
+  `AEADBadTagException` (cause keystore2 `VERIFICATION_FAILED`) every launch → `securePrefs` null forever → every
+  sign-in `SecureStorageUnavailable`, an ephemeral device id per launch. `openSecureStoreWithRecovery` (Storage.kt):
+  content failures only (`isUnreadableSecureStore`: `BadPaddingException` / `*InvalidProtocolBufferException` anywhere in
+  the cause chain) → `deleteSharedPreferences` + recreate ONCE, logged; anything else / a second failure stays
+  fail-closed. ⚠ The master key alias is deliberately NOT deleted — `_androidx_security_master_key_` is the library
+  DEFAULT alias, shared with the host app's own encrypted prefs. `Storage` now has an internal primary constructor
+  `(prefs, securePrefs)` so the suite drives the real class over `MemoryPrefs`. Emulator: restored copy → recovery
+  logged, fresh guest, same user + device id over 2 relaunches. New `res/xml/sendora_data_extraction_rules.xml`
+  (Android 12+ ignores `fullBackupContent` for targetSdk 31+ apps); README section rewritten.
+- **Foreground process death.** The queue reached disk only on `onStop` / after a flush answer. `EventQueue.add` now
+  arms ONE coalesced write `PERSIST_COALESCE_MS` (1 s) later on the queue's IO scope (`schedulePersistLocked`);
+  `track()` only launches the add, so it never waits. Emulator: 7 events queued (consent pending), force-stop 1.5 s later
+  → "Loaded 7 persisted events" → delivered 201 on relaunch. ⚠ The last ≤ 1 s is still lost by design.
+- Guards: `SecureStoreRecoveryTest` (5), `EventQueueTest` +2, `GeofenceOptionalDepTest` (1) — 141 JVM tests (8 live
+  skipped). Mutations S1–S5, Q1–Q3, G1, all red (table below). Live suite re-run after: 8/8 PASS.
+
 ## 4.28.0 — F67: queue chunks + permanent-4xx drop, Retry-After / cf-mitigated, knownDeviceToken, push Bearer, final link revoke (s58.402)
 
 **Why.** Two shipped queue defects made an offline backlog permanent: `EventQueue` sent the WHOLE queue (≤ 1000) as ONE
@@ -226,6 +278,15 @@ out of `packages/shared/src/types/auth-service.ts` and compares the SENT body (m
 | R11 | decorated bytes not counted | 1 |
 | R12 | token attached to any user's event | 1 |
 | R13 | lone event to /events | 1 |
+| S1 | unreadable secure store left null (no recovery) | 2 |
+| S2 | recreate without deleting | 2 |
+| S3 | recreate more than once | 1 |
+| S4 | wipe on any failure (platform errors too) | 1 |
+| S5 | cause chain ignored | 1 |
+| Q1 | no persist on add | 2 |
+| Q2 | persist synchronously inside add | 1 |
+| Q3 | no coalescing (a write per add) | 1 |
+| G1 | handleBroadcast unguarded without play-services-location | 1 |
 
 **60 / 60 red** — the WHOLE set re-run after round 3 at 112 tests (cp backup under a path-unique name → mutate → suite → restore, byte-identical each). M3 (cf → DROP) is superseded by R1; M20 / N11 by N6 / R9 (the rules they guarded changed). ⚠ Deviations: 429 whole-client hold clamped to 60 s (a per-route 429 — support's per-ticket 600 s —
 must not black out events + refresh); offline does not spend the attempt budget; the new revoke overload takes

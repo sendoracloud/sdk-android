@@ -363,6 +363,48 @@ class LiveStagingTest {
         assertTrue(ok)
     }
 
+    // ─── 8: server consent + flags carry identify()'s token for the identified user only ───
+
+    @Test
+    fun s8_consent_and_flags_carry_the_identity_token_for_the_identified_user_only() = live("T8") {
+        // The real identify() / identityProof() wiring (init() needs a Context; identify touches nothing that does).
+        val configured = SendoraCloud::class.java.getDeclaredField("isConfigured").apply { isAccessible = true }
+        val uid = "f67-live-user-$run"
+        val other = "f67-live-other-$run"
+        // A well-formed but unprovable HMAC: the server answers 2xx and simply treats the call as unverified.
+        val token = "hmac_v1:" + "0".repeat(64)
+        configured.setBoolean(SendoraCloud, true)
+        try {
+            SendoraCloud.identify(uid, options = SendoraCloudIdentifyOptions(identityToken = token))
+            val transport = Recording(ApiClient(STAGING, key))
+            val consent = SendoraCloudConsent(false, { transport }, { SendoraCloud.identityProof() })
+            val flags = SendoraCloudFlags({ transport }, { uid }, { SendoraCloud.identityProof() })
+            val rec = runCatching { consent.record("analytics", true, userId = uid, source = "f67-live") }
+            val del = runCatching { consent.requestDeletion(userId = other, reason = "f67 live run") }
+            val one = runCatching { flags.evaluate("f67-live-flag") }
+            val all = runCatching { flags.evaluateAll(userId = other) }
+            fun sent(path: String) = transport.sent.last { it.path == path }
+            val recSent = sent("/consent/record"); val delSent = sent("/consent/deletion-request")
+            val oneSent = sent("/feature-flags/evaluate"); val allSent = sent("/feature-flags/evaluate-all")
+            val calls = listOf(rec, del, one, all)
+            val okCalls = calls.all { it.isSuccess }
+            val tokenRule = "identityToken" in recSent.bodyKeys && "identityToken" !in delSent.bodyKeys &&
+                "identityToken" in oneSent.bodyKeys && "identityToken" !in allSent.bodyKeys
+            val err = calls.mapNotNull { it.exceptionOrNull() as? SendoraCloudApiException }.joinToString { "${it.operation} ${it.status} ${it.code}" }
+            report("8 consent + flags", okCalls && tokenRule,
+                "record(identified)=${rec.map { "${it.id.take(8)} verified=${it.sourceVerified}" }.getOrNull() ?: "FAIL"} token=${"identityToken" in recSent.bodyKeys}; " +
+                "requestDeletion(other)=${del.getOrNull()?.status ?: "FAIL"} token=${"identityToken" in delSent.bodyKeys}; " +
+                "evaluate(identified)=${one.getOrNull()?.reason ?: "FAIL"} token=${"identityToken" in oneSent.bodyKeys}; " +
+                "evaluateAll(other)=${all.getOrNull()?.size?.let { "$it flags" } ?: "FAIL"} token=${"identityToken" in allSent.bodyKeys}" +
+                (if (err.isNotEmpty()) "; errors: $err" else ""))
+            assertTrue("all four calls 2xx ($err)", okCalls)
+            assertTrue("the token rides along for the identified user only", tokenRule)
+        } finally {
+            SendoraCloud.reset()
+            configured.setBoolean(SendoraCloud, false)
+        }
+    }
+
     // ─── 4 (last: it exhausts this machine's ingest lane for up to a minute) ─
 
     @Test

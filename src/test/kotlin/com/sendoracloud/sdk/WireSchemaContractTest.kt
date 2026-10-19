@@ -19,9 +19,9 @@ import org.junit.Test
 class WireSchemaContractTest {
 
     /** The top-level keys of `export const <name> = z.object({ … })` in the shared types. */
-    private fun schemaKeys(name: String): Set<String> {
-        val file = repoFile("packages/shared/src/types/auth-service.ts")
-        assertNotNull("packages/shared/src/types/auth-service.ts is found from the module dir", file)
+    private fun schemaKeys(name: String, types: String = "auth-service"): Set<String> {
+        val file = repoFile("packages/shared/src/types/$types.ts")
+        assertNotNull("packages/shared/src/types/$types.ts is found from the module dir", file)
         val src = file!!.readText()
         val start = src.indexOf("export const $name = z.object({")
         check(start >= 0) { "$name not found" }
@@ -76,5 +76,30 @@ class WireSchemaContractTest {
         rig.transport.enqueue("/auth-service/guest/discard", okEnvelope(mapOf("userId" to "g1", "status" to "purged")))
         rig.auth.discardHeldGuest("g1").getOrThrow()
         assertEquals(expected, rig.transport.sent("/auth-service/guest/discard").single().body!!.keys)
+    }
+
+    // ─── 4.29.0: consent + flags ────────────────────────────────────────────
+
+    private val consent = SendoraCloudConsent(false, { null }, { null })
+    private val flags = SendoraCloudFlags({ null }, { null }, { null })
+    private val entity = "6f1a2b3c-4d5e-4f60-8a9b-0c1d2e3f4a5b"
+
+    @Test
+    fun `consent record sends recordConsentSchema's keys (all but the two Android does not offer)`() {
+        val schema = schemaKeys("recordConsentSchema", "consent")
+        val sent = consent.recordBody("analytics", true, entity, "u1", "a@b.co", "banner", "tok").keys
+        assertEquals("every key sent is the schema's", emptySet<String>(), sent - schema)
+        assertEquals("phone (SMS) and ipHash (secret keys only) are the only schema keys not offered", setOf("phone", "ipHash"), schema - sent)
+    }
+
+    @Test
+    fun `consent deletion-request sends exactly createDeletionRequestSchema's keys`() {
+        assertEquals(schemaKeys("createDeletionRequestSchema", "consent"), consent.deletionBody(entity, "u1", "a@b.co", "why", "tok").keys)
+    }
+
+    @Test
+    fun `flags evaluate and evaluate-all send exactly their schemas' keys`() {
+        assertEquals(schemaKeys("evaluateFlagSchema", "feature-flags"), flags.evaluateBody("k", "u1", entity, "production", "tok").keys)
+        assertEquals(schemaKeys("evaluateAllFlagsSchema", "feature-flags"), flags.evaluateAllBody("u1", entity, "production", "tok").keys)
     }
 }

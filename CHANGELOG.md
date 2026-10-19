@@ -1,5 +1,38 @@
 # Changelog
 
+## 4.29.0 — server consent records and feature flags, with identify()'s identity token
+
+Additive; nothing existing changes. Android had no server consent or flags API until now.
+
+- **`SendoraCloud.consent.record(purpose, granted, entityId, userId, email, source, identityToken)`** and
+  **`consent.requestDeletion(entityId, userId, email, reason, identityToken)`** (suspend) — the server consent ledger
+  (`/consent/record`, `/consent/deletion-request`). `consent.grant()` / `revoke()` are unchanged: they still gate the
+  SDK's event upload on the device only.
+- **`SendoraCloud.flags.evaluate(key, userId, entityId, environment, identityToken)`** → `FlagValue(key, value, variant,
+  reason)` and **`flags.evaluateAll(...)`** → `Map<String, FlagValue>` (suspend). `userId` defaults to the identified user.
+  `reason` is the server's matched rule; `variant` is null until the server sends one.
+- **The identity token.** An `identityToken` you pass is sent as given. Otherwise the token from
+  `identify(userId, options = SendoraCloudIdentifyOptions(identityToken = …))` is sent only when the call is about that
+  same user, and only if it fits the route (flags 128 characters, consent 256). It is kept in memory only, and
+  `reset()` — or an `identify()` without a token — forgets it.
+- A refusal throws `SendoraCloudApiException` (`operation`, `status`, `code`); no answer is status 0, `NETWORK`.
+
+Fixes found by testing a real app on an Android device before release:
+
+- **Fix: release builds with R8 / ProGuard failed.** An app that minifies and does not add the optional
+  `com.android.installreferrer:installreferrer` or `com.google.android.gms:play-services-location` libraries failed to
+  build ("Missing class com.android.installreferrer.api.InstallReferrerClient"). The SDK's consumer rules now tell R8
+  those classes may be absent. Without `play-services-location`, the geofence calls do nothing and log a hint instead of
+  throwing `NoClassDefFoundError` into your app.
+- **Fix: after a backup restore, sign-in was refused on that device for good.** Android Auto Backup copies the SDK's
+  encrypted preferences to a new device or a reinstall, where the key that opens them does not exist. The SDK then
+  refused every sign-in (`SecureStorageUnavailable`) and reported a new device id on every launch. It now deletes the
+  unreadable store once and starts the device as a new guest with a stable device id. New `sendora_data_extraction_rules.xml`
+  for Android 12+ (which ignores `fullBackupContent`); the README shows how to exclude the SDK's files on every version.
+- **Fix: events tracked while the app was open were lost if the process died.** The queue reached disk only when the
+  app went to the background. It is now also saved within a second of `track()` (one write per second at most, off the
+  main thread), so a crash or force-stop loses at most the last second.
+
 ## 4.28.1 — claimHeldGuest() works
 
 - **Fix: `claimHeldGuest()` and the deprecated `merge()` never worked (4.26.0 – 4.28.0).** They sent the `/auth-service/merge` body under

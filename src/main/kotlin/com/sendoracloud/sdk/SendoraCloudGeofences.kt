@@ -6,11 +6,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import com.sendoracloud.sdk.internal.ApiClient
+import com.sendoracloud.sdk.internal.SendoraCloudLogger
 import com.google.android.gms.location.Geofence
 import com.google.android.gms.location.GeofencingClient
 import com.google.android.gms.location.GeofencingEvent
 import com.google.android.gms.location.GeofencingRequest
 import com.google.android.gms.location.LocationServices
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -47,7 +49,11 @@ class SendoraCloudGeofences internal constructor(
 ) {
     /** Google's hard cap. SDK trims to head-by-priority. */
     private val androidGeofenceCap = 100
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    // ⚠ 4.29.0: with a handler — a throw in a launch here used to reach the app's
+    // uncaught-exception handler (this scope had none, unlike every other SDK scope).
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob() + CoroutineExceptionHandler { _, e ->
+        SendoraCloudLogger.error("Geofence coroutine error", e)
+    })
 
     private fun client(context: Context): GeofencingClient =
         LocationServices.getGeofencingClient(context.applicationContext)
@@ -64,6 +70,7 @@ class SendoraCloudGeofences internal constructor(
     /** Re-pull + reconcile. Call on app foreground or after operator
      *  may have changed geofences server-side. */
     fun refresh(context: Context) {
+        if (!isLocationAvailable("refresh")) return
         scope.launch {
             val res = client.get("/push/geofences/list-for-device")
             val data = res?.get("data") as? List<*> ?: emptyList<Any>()
@@ -74,6 +81,7 @@ class SendoraCloudGeofences internal constructor(
 
     /** Stop monitoring all SDK-registered geofences. */
     fun stop(context: Context) {
+        if (!isLocationAvailable("stop")) return
         client(context).removeGeofences(broadcastIntent(context))
     }
 
@@ -144,6 +152,7 @@ class SendoraCloudGeofences internal constructor(
      * `com.sendoracloud.GEOFENCE_TRANSITION`.
      */
     fun handleBroadcast(intent: Intent): Boolean {
+        if (!isLocationAvailable("handleBroadcast")) return false
         val event = GeofencingEvent.fromIntent(intent) ?: return false
         if (event.hasError()) return false
         val transition = event.geofenceTransition
@@ -177,5 +186,25 @@ class SendoraCloudGeofences internal constructor(
 
     companion object {
         const val SENDORA_GEOFENCE_ACTION = "com.sendoracloud.GEOFENCE_TRANSITION"
+
+        @Volatile private var locationAvailable: Boolean? = null
+
+        /**
+         * 4.29.0 — `play-services-location` is `compileOnly` (the app adds it to use
+         * geofences). Without it every call here threw `NoClassDefFoundError` into the
+         * app (`stop` / `handleBroadcast` synchronously, `refresh` from a coroutine
+         * with no handler). Probed once, like `PlayInstallReferrer.isAvailable`; the
+         * class name is kept by the SDK's consumer rules so the probe survives R8.
+         */
+        internal fun isLocationAvailable(op: String): Boolean {
+            val ok = locationAvailable ?: (try {
+                Class.forName("com.google.android.gms.location.LocationServices")
+                true
+            } catch (_: Throwable) {
+                false
+            }).also { locationAvailable = it }
+            if (!ok) SendoraCloudLogger.error("geofences.$op ignored — add com.google.android.gms:play-services-location to use geofences")
+            return ok
+        }
     }
 }

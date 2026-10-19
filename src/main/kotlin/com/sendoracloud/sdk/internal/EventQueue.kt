@@ -217,6 +217,8 @@ internal class EventQueue(
     private val maxAttempts: Int = MAX_ATTEMPTS,
     private val clock: () -> Long = System::currentTimeMillis,
     private val random: (Long) -> Long = Backoff.defaultRandom,
+    /** 4.29.0 — how long an [add] waits before the coalesced write to disk. */
+    private val persistDelayMs: Long = PERSIST_COALESCE_MS,
 ) {
     companion object {
         /** `/events/batch` accepts 1–100 (`packages/shared/src/types/events.ts` `batchEventsSchema`). */
@@ -236,6 +238,15 @@ internal class EventQueue(
 
         /** The per-event retry budget: answered transient failures before the event is dropped. */
         const val MAX_ATTEMPTS = 50
+
+        /**
+         * 4.29.0 — an [add] is written to disk at most this long after it happens,
+         * coalesced (one write for any number of adds in the window). Before, the
+         * queue reached disk only on background (`onStop`) or after a flush answer,
+         * so a process killed in the foreground (crash, force-stop, OOM) lost every
+         * event since — up to `flushAt - 1` events and a 30 s timer window.
+         */
+        const val PERSIST_COALESCE_MS = 1_000L
     }
 
     /** One queued event + its attempt count. Identity (not equality) is what a flush removes by. */
@@ -255,6 +266,9 @@ internal class EventQueue(
      */
     private var flushHandler: (suspend (List<Map<String, Any?>>) -> FlushResult)? = null
     private var flushJob: Job? = null
+
+    /** The pending coalesced write (4.29.0). Set/cleared only under `mutex`. */
+    private var persistJob: Job? = null
 
     /**
      * Guards against overlapping flushes racing on the same events (timer tick
@@ -330,6 +344,7 @@ internal class EventQueue(
                 entries.subList(0, entries.size - maxSize).clear()
             }
             shouldFlush = entries.size >= flushAt
+            schedulePersistLocked()
         }
         // Flush outside the lock so the HTTP round-trip never blocks concurrent
         // add() callers (the lock only guards the in-memory list mutation).
@@ -357,6 +372,22 @@ internal class EventQueue(
         mutex.withLock {
             persistLocked()
             SendoraCloudLogger.debug("Persisted ${entries.size} events to disk")
+        }
+    }
+
+    /**
+     * 4.29.0 — arm ONE write [persistDelayMs] from now unless one is already
+     * pending. It runs on the queue's IO scope, so `track()` (which only launches
+     * the [add]) never waits on serialization or disk.
+     */
+    private fun schedulePersistLocked() {
+        if (persistJob?.isActive == true) return
+        persistJob = scope.launch {
+            delay(persistDelayMs)
+            mutex.withLock {
+                persistJob = null
+                persistLocked()
+            }
         }
     }
 

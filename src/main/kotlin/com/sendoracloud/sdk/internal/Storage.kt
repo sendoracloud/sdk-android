@@ -8,6 +8,63 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 
+/** The encrypted tier's file (frozen name, ADR-023). */
+internal const val SECURE_PREFS_NAME = "sendora_sdk_secure"
+
+/**
+ * 4.29.0 — is this a failure of the STORE'S CONTENT (a keyset the current master
+ * key cannot open), as opposed to the platform (no Keystore, missing AndroidX)?
+ * Android Auto Backup restores `sendora_sdk_secure.xml` onto a new device (or a
+ * reinstall) whose Keystore holds a different master key: the keyset's MAC fails
+ * (`AEADBadTagException`, caused by keystore2 `VERIFICATION_FAILED`). A corrupt
+ * keyset blob fails protobuf parsing. Only these are wiped — a transient Keystore
+ * error must never delete a readable session.
+ */
+internal fun isUnreadableSecureStore(t: Throwable): Boolean {
+    var c: Throwable? = t
+    var depth = 0
+    while (c != null && depth++ < 16) {
+        if (c is javax.crypto.BadPaddingException) return true // incl. AEADBadTagException
+        if (c.javaClass.name.endsWith("InvalidProtocolBufferException")) return true
+        c = c.cause
+    }
+    return false
+}
+
+/**
+ * 4.29.0 — open the encrypted store; when its CONTENT is unreadable
+ * ([isUnreadableSecureStore]) delete it and recreate it ONCE. Before this, an
+ * Auto Backup restore left the store permanently unopenable: every launch
+ * refused sign-in (`SecureStorageUnavailable`) and minted a new ephemeral
+ * device id. Now the device starts as a fresh guest with a persisted, stable
+ * device id (the old session was undecryptable anyway — nothing readable is
+ * lost). Any other failure, or a second failure, stays fail-closed (null).
+ */
+internal fun <T : Any> openSecureStoreWithRecovery(
+    open: () -> T,
+    wipe: () -> Boolean,
+    log: (String, Throwable?) -> Unit = { m, t -> SendoraCloudLogger.error(m, t) },
+): T? {
+    val first = try {
+        return open()
+    } catch (t: Throwable) {
+        t
+    }
+    if (!isUnreadableSecureStore(first)) {
+        log("EncryptedSharedPreferences init failed — auth tokens will not persist. Refusing plaintext fallback.", first)
+        return null
+    }
+    log("EncryptedSharedPreferences unreadable (restored from a backup or a reset Keystore) — deleting and recreating it once; this device starts signed out", first)
+    val wiped = try { wipe() } catch (t: Throwable) { log("Could not delete the unreadable secure store", t); false }
+    if (!wiped) log("The unreadable secure store may not have been fully deleted — trying to recreate it anyway", null)
+    return try {
+        open()
+    } catch (t: Throwable) {
+        log("EncryptedSharedPreferences still unavailable after recreating it — auth tokens will not persist. Refusing plaintext fallback.", t)
+        null
+    }
+}
+
 /**
  * Persistent storage.
  *  - Non-sensitive (`isFirstLaunch`, `sessionId`) lives in plain SharedPreferences.
@@ -21,34 +78,42 @@ import java.util.UUID
  * silently downgraded to plaintext SharedPreferences. The previous fallback
  * exposed access + refresh tokens in cleartext on disk — full account
  * takeover on rooted devices or via post-uninstall data extraction.
+ * 4.29.0: an UNREADABLE store (restored backup) is deleted and recreated once —
+ * see [openSecureStoreWithRecovery]. The primary constructor takes the two
+ * tiers directly so the JVM suite drives the real class over in-memory prefs.
  */
-internal class Storage(context: Context) : AuthStore, EventQueueStore {
-    private val prefs: SharedPreferences =
-        context.getSharedPreferences("sendora_sdk", Context.MODE_PRIVATE)
-
+internal class Storage internal constructor(
+    private val prefs: SharedPreferences,
     /**
      * Null when secure storage is unavailable. Every secure getter/setter
      * checks this and refuses the operation if null — token persistence
      * fails closed instead of degrading to plaintext.
      */
-    private val securePrefs: SharedPreferences? = runCatching {
-        val master = MasterKey.Builder(context)
-            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-            .build()
-        EncryptedSharedPreferences.create(
-            context,
-            "sendora_sdk_secure",
-            master,
-            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-        )
-    }.getOrElse { err ->
-        SendoraCloudLogger.error(
-            "EncryptedSharedPreferences init failed — auth tokens will not persist. Refusing plaintext fallback.",
-            err,
-        )
-        null
-    }
+    private val securePrefs: SharedPreferences?,
+) : AuthStore, EventQueueStore {
+
+    constructor(context: Context) : this(
+        context.getSharedPreferences("sendora_sdk", Context.MODE_PRIVATE),
+        openSecureStoreWithRecovery(
+            open = {
+                val master = MasterKey.Builder(context)
+                    .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                    .build()
+                EncryptedSharedPreferences.create(
+                    context,
+                    SECURE_PREFS_NAME,
+                    master,
+                    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+                )
+            },
+            // Evicts the in-memory instance too (ContextImpl's prefs cache). The keysets
+            // live INSIDE this file, so deleting it is the whole reset. ⚠ The AndroidKeyStore
+            // master key is NOT deleted: `_androidx_security_master_key_` is the library's
+            // DEFAULT alias, shared with any EncryptedSharedPreferences the host app owns.
+            wipe = { context.deleteSharedPreferences(SECURE_PREFS_NAME) },
+        ),
+    )
 
     /** True when secure storage is available. Auth.signIn etc. should
      *  surface a configuration error to the consumer if false. */

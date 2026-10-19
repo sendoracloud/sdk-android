@@ -471,4 +471,43 @@ class EventQueueTest {
         assertEquals("the late event went out in its own chunk", listOf(2, 1), chunks.map { it.size })
         assertEquals("…and stays queued after that chunk failed", 1, q.count)
     }
+
+    // ─── 4.29.0: persisted on add (process death in the foreground) ──────────
+
+    private fun awaitTrue(timeoutMs: Long = 3_000, cond: () -> Boolean) {
+        val end = System.currentTimeMillis() + timeoutMs
+        while (!cond() && System.currentTimeMillis() < end) Thread.sleep(10)
+    }
+
+    @Test
+    fun `added events survive process death - a new queue over the same storage restores them`() = runBlocking {
+        val store = MemoryStore()
+        val before = EventQueue(store, flushAt = Int.MAX_VALUE, persistDelayMs = 20)
+        before.fill(7) // below flushAt, never backgrounded, never flushed
+        awaitTrue { store.events.size == 7 }
+        // The process dies here: nothing else runs. A fresh launch builds a new queue on the same disk.
+        val after = EventQueue(store, flushAt = Int.MAX_VALUE, persistDelayMs = 20)
+        assertEquals("all 7 restored", 7, after.count)
+        assertEquals((0 until 7).map { "e$it" }, after.snapshot().map { it["eventType"] })
+    }
+
+    @Test
+    fun `the write on add is coalesced and never made inside add itself`() = runBlocking {
+        var saves = 0
+        val store = object : EventQueueStore {
+            var events: List<Map<String, Any?>> = emptyList()
+            override fun loadEventQueue() = events
+            override fun saveEventQueue(events: List<Map<String, Any?>>) { saves++; this.events = events }
+            override fun clearEventQueue() { events = emptyList() }
+            override fun loadEventAttempts() = emptyList<Int>()
+            override fun saveEventAttempts(attempts: List<Int>) {}
+        }
+        val q = EventQueue(store, flushAt = Int.MAX_VALUE, persistDelayMs = 500)
+        q.fill(50)
+        assertEquals("add() returned without writing to disk", 0, saves)
+        awaitTrue { saves >= 1 }
+        Thread.sleep(700)
+        assertEquals("50 adds inside the window = ONE write", 1, saves)
+        assertEquals(50, store.events.size)
+    }
 }

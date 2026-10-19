@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 12+ (API 31) backup rules for host apps — the `android:dataExtractionRules` twin of
+  sendora_backup_rules.xml (which Android 11 and lower read via `android:fullBackupContent`).
+  On Android 12+ a targetSdk 31+ app's `fullBackupContent` is IGNORED for cloud backup and
+  device-to-device transfer, so shipping only the older file excluded nothing on most devices.
+
+  NOT wired into the SDK's manifest (a library declaring it conflicts with every app that has its
+  own — see sendora_backup_rules.xml). Point your manifest at it, or copy these lines into yours:
+
+      <application
+          android:dataExtractionRules="@xml/sendora_data_extraction_rules"
+          android:fullBackupContent="@xml/sendora_backup_rules" />
+
+  (`tools:replace` is needed only if another library's manifest sets the same attribute.)
+
+  Why exclude: `sendora_sdk_secure.xml` is sealed by an Android Keystore key that is never backed up,
+  so a restored copy cannot be opened on the new device. Since 4.29.0 the SDK detects that, deletes the
+  file and starts the device as a fresh guest (it used to refuse every sign-in on that device). The
+  plain `sendora_sdk.xml` holds the event queue and first-launch marker; restored, it re-sends the old
+  device's queued events and suppresses the new install's attribution report.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="sendora_sdk.xml" />
+        <exclude domain="sharedpref" path="sendora_sdk_secure.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="sendora_sdk.xml" />
+        <exclude domain="sharedpref" path="sendora_sdk_secure.xml" />
+    </device-transfer>
+</data-extraction-rules>

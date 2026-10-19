@@ -40,6 +40,8 @@ object SendoraCloud {
     private var appContext: Context? = null
     private var currentUserId: String? = null
     private var currentIdentityToken: String? = null
+    /** 4.29.0 — the userId identify() was given with [currentIdentityToken] (the token proves exactly that user). */
+    private var identityTokenUserId: String? = null
     private var isConfigured = false
 
     // --- Engagement time (foreground-only, Wave 75) ---
@@ -82,6 +84,19 @@ object SendoraCloud {
      * ([supportTransport]) — `createTicket`, the player's own tickets, `deviceContext()`.
      */
     val support: SendoraCloudSupport = SendoraCloudSupport()
+
+    /** 4.29.0 — server-side feature-flag evaluation (`/feature-flags/evaluate[-all]`). */
+    val flags: SendoraCloudFlags = SendoraCloudFlags()
+
+    /** identify()'s `(userId, identityToken)`, or null — in memory only, never persisted (4.29.0). */
+    internal fun identityProof(): IdentityProof? {
+        val uid = identityTokenUserId ?: return null
+        val token = currentIdentityToken ?: return null
+        return IdentityProof(uid, token)
+    }
+
+    /** The identified user (identify() or the signed-in account) — the default `userId` of a flag evaluation. */
+    internal fun analyticsUserId(): String? = currentUserId
 
     /** 4.27.0 — the configured client for support calls (null before `init`). */
     internal fun supportTransport(): com.sendoracloud.sdk.internal.AuthTransport? = apiClient
@@ -210,6 +225,7 @@ object SendoraCloud {
                 if (effects.clearUserId) {
                     currentUserId = null
                     currentIdentityToken = null
+                    identityTokenUserId = null
                     store.cachedUserId = null
                 }
                 if (effects.rotateDeviceId) {
@@ -491,6 +507,7 @@ object SendoraCloud {
         }
         currentUserId = userId
         currentIdentityToken = options?.identityToken
+        identityTokenUserId = options?.identityToken?.let { userId }
         storage?.cachedUserId = userId
         trackEvent("user.identified", traits ?: emptyMap())
     }
@@ -523,6 +540,7 @@ object SendoraCloud {
         if (!isConfigured) return
         currentUserId = null
         currentIdentityToken = null
+        identityTokenUserId = null
         storage?.cachedUserId = null
         storage?.regenerateDeviceId()
         storage?.sessionId = UUID.randomUUID().toString()

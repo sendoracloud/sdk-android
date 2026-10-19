@@ -21,7 +21,7 @@ Add the dependency in your module's `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("com.github.sendoracloud:sdk-android:4.28.1")
+    implementation("com.github.sendoracloud:sdk-android:4.29.0")
 }
 ```
 
@@ -260,6 +260,21 @@ val created = SendoraCloud.support.createTicket(subject = "Purchase not restored
 
 Refusals throw `SendoraSupportException` (`code` — e.g. `PROJECT_MISMATCH`, `NOT_SIGNED_IN` — and `status`).
 
+## Consent records + feature flags (4.29.0)
+
+```kotlin
+// After identify(userId, options = SendoraCloudIdentifyOptions(identityToken = hmacFromYourServer)),
+// these calls carry that token for that user only — the server can then trust them.
+val record = SendoraCloud.consent.record(purpose = "marketing", granted = true, userId = "user-42", source = "settings")
+val request = SendoraCloud.consent.requestDeletion(userId = "user-42", reason = "Closing my account")
+
+val flag = SendoraCloud.flags.evaluate("new-onboarding")        // userId defaults to the identified user
+val all = SendoraCloud.flags.evaluateAll()                       // Map<String, FlagValue>
+```
+
+All four are `suspend`. A refusal throws `SendoraCloudApiException` (`status`, `code`). `consent.grant()` /
+`revoke()` are unchanged: they gate the SDK's own event upload on the device and do not call the server.
+
 ## Security model
 
 - **Secret-key refusal.** `init()` logs + aborts if given a key starting with `sk_`.
@@ -268,7 +283,8 @@ Refusals throw `SendoraSupportException` (`code` — e.g. `PROJECT_MISMATCH`, `N
 - **Host allowlist.** `handleDeepLink` returns `null` for URIs whose host isn't in `config.linkHosts` (default `sendoracloud.com`).
 - **Bundle-id gate.** `links.create()` forwards `appContext.packageName` automatically; backend rejects a leaked public key + wrong package as `LinkError(code = BUNDLE_MISMATCH, statusCode = 422)`.
 - **Encrypted storage.** `userId` + `deviceId` live in `EncryptedSharedPreferences` (AES256-GCM, master key in AndroidKeyStore). Event queue persisted to disk has `userId` + `traits` stripped.
-- **Backup exclusion.** Ships `sendora_backup_rules.xml` — opt into it in your manifest to exclude the SDK's prefs from Auto Backup.
+- **Backup exclusion.** Ships `sendora_data_extraction_rules.xml` (Android 12+) and `sendora_backup_rules.xml` (Android 11 and lower) — opt into both in your manifest to exclude the SDK's prefs from Auto Backup (see below).
+- **Restored-backup recovery.** The encrypted store is sealed by an Android Keystore key that is never backed up, so a restored copy cannot be opened. Since 4.29.0 the SDK deletes it and starts the device as a fresh guest; earlier versions refused every sign-in on that device.
 - **Input validation.** Event names must match `[A-Za-z0-9._:-]{1,128}`; properties cap at 32 KB, depth 5; `__proto__`/`constructor`/`prototype` keys are blocked.
 - **Consent gating.** Events buffer in-memory until `consent.grant()`.
 - **Exponential backoff + circuit breaker.** `ApiClient` backs off to 60 s after repeated failures and drops after 10 — no retry storms against your API.
@@ -276,13 +292,23 @@ Refusals throw `SendoraSupportException` (`code` — e.g. `PROJECT_MISMATCH`, `N
 
 ## Backup rules (recommended)
 
-Merge the included rules with your own:
+Android Auto Backup is on by default and copies the SDK's preferences to a new device or a reinstall. Exclude them:
+Android 12+ reads `android:dataExtractionRules`, Android 11 and lower read `android:fullBackupContent`, and a
+minSdk-26 app runs on both, so set both:
 
 ```xml
 <!-- AndroidManifest.xml -->
 <application
-    android:fullBackupContent="@xml/sendora_backup_rules"
-    tools:replace="android:fullBackupContent">
+    android:dataExtractionRules="@xml/sendora_data_extraction_rules"
+    android:fullBackupContent="@xml/sendora_backup_rules">
+```
+
+If your app already has its own rules files, add these lines to them instead — inside both `<cloud-backup>` and
+`<device-transfer>` of your data extraction rules, and inside `<full-backup-content>` of your backup rules:
+
+```xml
+<exclude domain="sharedpref" path="sendora_sdk.xml" />
+<exclude domain="sharedpref" path="sendora_sdk_secure.xml" />
 ```
 
 ## License
