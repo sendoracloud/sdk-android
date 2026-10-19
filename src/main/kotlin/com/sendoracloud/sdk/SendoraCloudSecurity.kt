@@ -23,7 +23,7 @@ internal object SendoraCloudValidator {
             )
         }
         if (!keyRegex.matches(key)) {
-            throw SendoraError.InvalidApiKey("expected pk_... (17+ chars)")
+            throw SendoraError.InvalidApiKey("expected pk_ followed by 16+ letters, digits, _ or - (19+ chars)")
         }
     }
 
@@ -44,7 +44,9 @@ internal object SendoraCloudValidator {
         assertNoForbidden(props)
         val depth = measureDepth(props)
         if (depth > MAX_DEPTH) throw SendoraError.PayloadTooDeep(depth)
-        val size = org.json.JSONObject(props).toString().length
+        // s58.405: UTF-8 BYTES of the serialised map (the message always said "bytes"; this used to count
+        // UTF-16 chars, so ~10,900 "€" (~32 KB of chars, ~98 KB on the wire) passed).
+        val size = org.json.JSONObject(props).toString().toByteArray(Charsets.UTF_8).size
         if (size > MAX_BYTES) throw SendoraError.PayloadTooLarge(size)
     }
 

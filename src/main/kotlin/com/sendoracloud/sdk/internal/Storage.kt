@@ -70,8 +70,8 @@ internal fun <T : Any> openSecureStoreWithRecovery(
  *  - Non-sensitive (`isFirstLaunch`, `sessionId`) lives in plain SharedPreferences.
  *  - `cachedUserId` + `deviceId` + auth tokens live in EncryptedSharedPreferences
  *    (AES256-GCM, key stored in AndroidKeyStore).
- *  - Event queue persisted with `userId` + `traits` stripped — they'll be
- *    re-injected from `currentUserId` at send time.
+ *  - Event queue persisted as it will be sent (s58.405: `userId` is KEPT — see
+ *    [saveEventQueue]); the identity token is never written.
  *
  * **Critical:** if EncryptedSharedPreferences cannot be initialised (corrupt
  * Keystore, missing AndroidX dep), token writes are REFUSED rather than
@@ -246,16 +246,21 @@ internal class Storage internal constructor(
     /** JSON-encoded `AuthUser`. Decoded by SendoraCloudAuth. */
     val authUserJson: String? get() = secureGet(AuthKeys.USER)
 
+    /**
+     * ⚠ s58.405: this used to strip `userId` (and a `properties.traits` key), claiming they would be
+     * "re-injected from `currentUserId` at send time" — nothing ever did, and the user at send time is not
+     * necessarily the one who produced the event. An identified event carries `userId` INSTEAD of
+     * `anonymousId` (`buildEventPayload`), so a restored event went out with NEITHER (unattributed) and could
+     * never get its send-time identity token (`decorateWithIdentity` matches on `userId`). The strip never
+     * covered `identify()`'s traits either: they are the `properties` of `user.identified`. The identity token
+     * is never stored (attached at send time only; removed here as a belt). Backward compatible: a queue
+     * written by ≤ 4.29.0 has no `userId`, which reads back as absent — exactly what those builds sent.
+     */
     override fun saveEventQueue(events: List<Map<String, Any?>>) {
         try {
             val jsonArray = JSONArray()
             events.forEach { event ->
-                val stripped = event.toMutableMap()
-                stripped.remove("userId")
-                (stripped["properties"] as? Map<*, *>)?.let { props ->
-                    stripped["properties"] = props.filterKeys { it != "traits" }
-                }
-                jsonArray.put(JSONObject(stripped))
+                jsonArray.put(JSONObject(if (event.containsKey("identityToken")) event - "identityToken" else event))
             }
             prefs.edit().putString("event_queue", jsonArray.toString()).apply()
         } catch (e: Exception) {

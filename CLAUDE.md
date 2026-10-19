@@ -42,6 +42,11 @@ under the new one — which corrupts every version-correlated support question
 without ever failing a build. It caught exactly this on the 4.18.0 bump.
 
 
+
+## 4.30.0 (s58.405) — built, not published
+
+`Storage.saveEventQueue` keeps `userId` / `properties.traits` (same drop as iOS) and strips `identityToken` (trackEvent stamps it at enqueue — it WAS written to plain prefs); `validateProperties` counts UTF-8 bytes (it counted chars; a behaviour change for 32 KB+ multi-byte properties); key error says 19+ chars. Guards `PersistedQueueIdentityTest` (3) + `ValidatorBytesTest` (3; ⚠ JVM org.json escapes U+2000–20FF like "€" as `\u20ac`, Android does not — byte tests use "中"); 147 JVM tests (8 live skipped).
+
 ## 4.29.0 — server consent + feature flags, identify()'s identityToken (s58.404)
 
 **What.** `SendoraCloudServerApis.kt`: `withInputIdentityToken` (pure port of RN `withInputIdentityToken`, RN ≥ 1.43.0),
@@ -607,7 +612,7 @@ SendoraCloud.passkeys?.register(activity) / authenticate(activity, email)   // A
 
 - `SendoraValidator` refuses `sk_` keys, non-HTTPS URLs, bad event names.
 - `EncryptedSharedPreferences` (AES256-GCM, AndroidKeyStore master) for userId + deviceId.
-- Event queue persisted with PII stripped.
+- Event queue persisted as sent (s58.405: `userId` kept; the identity token never written).
 - `network_security_config.xml` disables cleartext.
 
 ## Geofences (s58.22)

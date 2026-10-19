@@ -1,5 +1,26 @@
 # Changelog
 
+## 4.30.0 — the identity token stays off disk; queued events keep their user; properties are measured in bytes
+
+- **License: Apache-2.0.** The package now ships the full license text in `LICENSE` (none shipped before).
+
+- **Fix: events queued before a relaunch keep their user.** The saved event queue dropped `userId`. An identified
+  event carries `userId` instead of `anonymousId`, so an event restored after a relaunch was sent with neither
+  (attributed to no one), and it could never get the identity token from `identify(…, options)`, which is attached
+  when the event is sent and only to that user's events. The queue is now saved exactly as it will be sent; a
+  `traits` key inside an event's properties is no longer removed either. A queue saved by an older version still
+  loads (its events simply have no `userId`, as before).
+- **Fix: the identity token is no longer written to disk.** `trackEvent` stamps `identify()`'s token on the event
+  and the saved queue kept it, in plain SharedPreferences. It is now removed when the queue is saved and attached
+  again when the event is sent.
+- **Behaviour change: the 32 KB event properties limit is now measured in UTF-8 bytes.** It counted characters
+  (the error always said "bytes"), so non-ASCII text was under-counted up to 3×. ⚠ An event whose properties are
+  over 32,768 UTF-8 bytes of multi-byte text but under 32,768 characters used to be queued and sent; `trackEvent`
+  now drops it and logs `payload too large: N bytes` (it does not throw). ASCII-only properties are measured
+  exactly as before.
+- The invalid-key error now states the real minimum: `expected pk_ followed by 16+ letters, digits, _ or -
+  (19+ chars)` (it said "17+ chars"; which keys are accepted is unchanged).
+
 ## 4.29.0 — server consent records and feature flags, with identify()'s identity token
 
 Additive; nothing existing changes. Android had no server consent or flags API until now.
