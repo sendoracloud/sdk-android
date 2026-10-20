@@ -1,5 +1,13 @@
 # Changelog
 
+## 4.32.0 — a held guest's support tickets can move to the account on discard
+
+- **`discardHeldGuest(id, keepSupportTickets = true)` keeps the player's support conversation.** The guest's support tickets — with their replies, rating and read
+  state — move to the signed-in account, then the guest is erased exactly as before. Nothing else moves. Needs an
+  identified session: otherwise the call fails with code `KEEP_TICKETS_REQUIRES_IDENTIFIED` (kind config) and nothing is
+  sent. The account's access token goes as the Bearer; a server refusal keeps the held guest. A new overload — every
+  existing call compiles and behaves as before. Needs the s58.405-k backend.
+
 ## 4.31.0 — `ACCOUNT_LOCKED` is retryable only with a wait
 
 - **Behaviour change: an `account_locked` error is retryable only when the server said when the lock lifts.**

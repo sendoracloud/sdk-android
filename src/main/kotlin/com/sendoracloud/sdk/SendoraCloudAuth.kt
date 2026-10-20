@@ -1721,16 +1721,59 @@ class SendoraCloudAuth internal constructor(
      * own. A 404 (already gone) also releases the slot; a 5xx / network failure
      * keeps it (the guest is not gone). Emits `GuestReleased(DISCARDED)`.
      */
-    suspend fun discardHeldGuest(id: String? = null): Result<Unit> = serialize {
+    suspend fun discardHeldGuest(id: String? = null): Result<Unit> = discardHeldGuest(id, keepSupportTickets = false)
+
+    /**
+     * [discardHeldGuest] with the opt-in `keepSupportTickets` (parity RN 1.45.0).
+     * When true, the server first moves the guest's support tickets — replies,
+     * rating and read state — to the CURRENT signed-in account, then erases the
+     * guest exactly as the plain discard does. Needs an identified session:
+     * anything else fails `KEEP_TICKETS_REQUIRES_IDENTIFIED` (kind CONFIG, not
+     * retryable) with nothing sent and the slot kept. The account's fresh access
+     * token goes as `Authorization: Bearer` (the server refuses 401 without it,
+     * 422 for an anonymous / other-project Bearer). A 2xx or 404 releases the
+     * slot; any other failure keeps it. With `false` the request is byte-for-byte
+     * the plain discard's.
+     *
+     * A separate overload (no default on [keepSupportTickets]) so the 4.26.0
+     * `discardHeldGuest(id)` keeps its JVM signature and `discardHeldGuest()` /
+     * `discardHeldGuest("id")` stay unambiguous; call it as
+     * `discardHeldGuest(id, keepSupportTickets = true)` or
+     * `discardHeldGuest(keepSupportTickets = true)`.
+     */
+    suspend fun discardHeldGuest(id: String? = null, keepSupportTickets: Boolean): Result<Unit> = serialize {
         rejectIfWithheld()?.let { return@serialize Result.failure(it) }
+        if (keepSupportTickets && status() != AuthStatus.IDENTIFIED) {
+            return@serialize Result.failure(SendoraCloudAuthError.Unknown(
+                "keepSupportTickets moves the guest's tickets to the signed-in account; sign in first",
+                code = "KEEP_TICKETS_REQUIRES_IDENTIFIED", kind = SendoraCloudAuthErrorKind.CONFIG,
+            ))
+        }
         val index = resolveHeldIndex(id).getOrElse { return@serialize Result.failure(it) }
-        discardSlot(index)
+        // Safe under `mutex`: getAccessToken() refreshes under the separate
+        // `refreshMutex` (the deleteAccount / listLinkedIdentities pattern).
+        val bearer = if (keepSupportTickets) {
+            val token = getAccessToken()
+                ?: return@serialize Result.failure(SendoraCloudAuthError.Unauthorized("Not signed in"))
+            mapOf("Authorization" to "Bearer $token")
+        } else null
+        discardSlot(index, bearer)
     }
 
-    private suspend fun discardSlot(index: Int): Result<Unit> {
+    /**
+     * Shared body of [discardHeldGuest] and `deleteAccount(alsoDiscardHeldGuests)`.
+     * [keepTicketsBearer] non-null = the keep-tickets variant (body flag + the
+     * account's Bearer); null = the plain discard, unchanged.
+     */
+    private suspend fun discardSlot(index: Int, keepTicketsBearer: Map<String, String>? = null): Result<Unit> {
         val guest = heldSlots[index]?.parsed ?: return Result.failure(SendoraCloudAuthError.Unknown("Held guest not found", code = "HELD_GUEST_NOT_FOUND"))
-        val response = client.post("/auth-service/guest/discard", mapOf("refreshToken" to guest.refreshToken))
-            ?: return Result.failure(SendoraCloudAuthError.Network("discardHeldGuest failed (network error)"))
+        val response = (
+            if (keepTicketsBearer != null) client.post(
+                "/auth-service/guest/discard",
+                mapOf("refreshToken" to guest.refreshToken, "keepSupportTickets" to true),
+                keepTicketsBearer,
+            ) else client.post("/auth-service/guest/discard", mapOf("refreshToken" to guest.refreshToken))
+        ) ?: return Result.failure(SendoraCloudAuthError.Network("discardHeldGuest failed (network error)"))
         val err = parseError(response)
         if (err != null && err.status != 404) return Result.failure(err)
         commit(AuthTx.Release(index, GuestReleasedReason.DISCARDED, endReason = null))

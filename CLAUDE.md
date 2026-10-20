@@ -43,7 +43,15 @@ without ever failing a build. It caught exactly this on the 4.18.0 bump.
 
 
 
-## 4.31.0 (s58.405-j) — built, not published — `account_locked` is retryable only with a wait
+## 4.32.0 (s58.405-k) — built, not published — keep a held guest's support tickets on discard
+
+New overload `discardHeldGuest(id, keepSupportTickets = true)` (no default on the flag, so existing calls stay unambiguous; the old verb forwards with false →
+byte-identical request). On: withheld gate → not identified → `KEEP_TICKETS_REQUIRES_IDENTIFIED` (config, nothing sent) →
+the account's access token via `getAccessToken()` under `mutex` (refresh uses `refreshMutex`) → body
+`keepSupportTickets: true` + `Authorization: Bearer`. Slot rules unchanged (2xx / 404 release). Guard `KeepTicketsDiscardTest` (7) + `WireSchemaContractTest` (body = `authGuestDiscardSchema` keys); mutations
+(no Bearer; no identified check) → red.
+
+## 4.31.0 (s58.405-j) — published — `account_locked` is retryable only with a wait
 
 `retryable` for `account_locked` = `retryAfterSeconds` present. The server's per-network and 20/hour waits send one;
 the 100-failure hard stop sends none and does not lift with time (reset the password / sign in another way). Every

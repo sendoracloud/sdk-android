@@ -75,6 +75,20 @@ class WireSchemaContractTest {
         val rig = Rig(store = store)
         rig.transport.enqueue("/auth-service/guest/discard", okEnvelope(mapOf("userId" to "g1", "status" to "purged")))
         rig.auth.discardHeldGuest("g1").getOrThrow()
+        // The plain discard sends every schema key except the opt-in flag.
+        assertEquals(expected - "keepSupportTickets", rig.transport.sent("/auth-service/guest/discard").single().body!!.keys)
+    }
+
+    @Test
+    fun `discardHeldGuest with keepSupportTickets sends exactly authGuestDiscardSchema's keys`() = runBlocking {
+        val expected = schemaKeys("authGuestDiscardSchema")
+        assertEquals(setOf("refreshToken", "keepSupportTickets"), expected) // sanity: the parser works
+        val store = RecordingStore()
+        store.seedHeld(0, heldSlotJson("g1", "rG1", heldAt = 1))
+        store.seedLegacySession(uB, jwt(uB.id, "sid-B", anonymous = false), "rB", 2_000_000_000_000L)
+        val rig = Rig(store = store)
+        rig.transport.enqueue("/auth-service/guest/discard", okEnvelope(mapOf("userId" to "g1", "status" to "purged")))
+        rig.auth.discardHeldGuest("g1", keepSupportTickets = true).getOrThrow()
         assertEquals(expected, rig.transport.sent("/auth-service/guest/discard").single().body!!.keys)
     }
 
